@@ -216,7 +216,7 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
 
     1. Stage 1: :func:`rank_root_candidates` on the ingroup ``baseline`` (or the
        given ``stage1`` result, which must have been run with the same
-       ``explicit``/``regression_k`` and ``keep_states``).
+       ``explicit``/``regression_k`` and must have kept its states).
     2. 2a: every Stage 1 candidate's best fitted state is scored post hoc with
        the messages (:func:`root_message_correction`).
     3. 2b: :func:`rank_root_candidates` on
@@ -233,8 +233,14 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
     date and root-incident branch lengths before and after; clock rates;
     root-state posteriors at ``posterior_positions`` (ingroup-only and 2b).
     """
+    # 2a and the warm starts need the fitted states: keep them until the rows are built,
+    # then drop them if the caller asked for keep_states=False
+    keep = rank_kwargs.pop('keep_states', True)
     if stage1 is None:
-        stage1 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, **rank_kwargs)
+        stage1 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, keep_states=True,
+                                      **rank_kwargs)
+    elif any(r.best_run is not None and r.best_run.error is None and r.best_run.state is None for r in stage1.results):
+        raise ValueError('rank_with_root_messages: the given stage1 result kept no states (keep_states=False)')
     rows_in = messages.values() if isinstance(messages, dict) else messages
     neutral = all(np.all(np.asarray(v, dtype=float) == 1.0) for v in rows_in)
     warm = {}
@@ -244,7 +250,7 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
             if b is not None and b.error is None and b.state is not None:
                 warm[candidate_key(r.candidate)] = (b.state, b.clock_rate)
     s2b = rank_root_candidates(baseline.with_root_state_messages(messages), explicit=explicit,
-                               regression_k=regression_k, warm_starts=warm, **rank_kwargs)
+                               regression_k=regression_k, warm_starts=warm, keep_states=True, **rank_kwargs)
     by2b = {candidate_key(r.candidate): r for r in s2b.results}
     rows = []
     pos = list(posterior_positions)
@@ -280,5 +286,10 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
                        clock_rate_2b=None, posterior_2b=None)
         row.setdefault('root_date_shift', None)
         rows.append(row)
+    if not keep:
+        for res in (stage1, s2b):
+            for r in res.results:
+                for x in r.runs:
+                    x.state = None
     return Stage2Result(stage1=stage1, stage2b=s2b, rows=rows)
 

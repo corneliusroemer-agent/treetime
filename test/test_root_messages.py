@@ -291,3 +291,21 @@ def test_independent_scorers_keep_messages_and_data_settings():
     assert score_newick(b.with_root_state_messages(m), nw) == pytest.approx(expect['combined'], abs=1e-8)
     assert score_tree_with_messages(b, tree, m)[0] == pytest.approx(expect['combined'], abs=1e-8)
     assert score_newick(plain, nw) != pytest.approx(expect['ingroup'], abs=1e-3)  # the added columns count
+
+
+def test_rank_with_root_messages_keep_states_false(b20, fitted):
+    """keep_states=False still gives 2a/2b rows and warm starts; the states are
+    dropped afterwards. A given Stage 1 result without states is rejected."""
+    from treetime.root_candidates import rank_root_candidates
+    b, true = b20
+    tt = fitted.state
+    m = outgroup_leaf_messages(tt.gtr, tt.tree.root._cseq[tt.data.full_to_compressed_sequence_map], 0.05)
+    kw = dict(explicit=[true], regression_k=0, fit=FIT)
+    res = rank_with_root_messages(b, m, keep_states=False, **kw)
+    row = res.rows[0]
+    assert row['combined_2a'] is not None and row['combined_2b'] >= row['combined_2a'] - 1e-8
+    assert any(x.initial_mode == 'warm' for x in res.stage2b.results[0].runs)
+    assert all(x.state is None for r in (res.stage1, res.stage2b) for c in r.results for x in c.runs)
+    s1 = rank_root_candidates(b, keep_states=False, **kw)
+    with pytest.raises(ValueError):
+        rank_with_root_messages(b, m, stage1=s1, **kw)
