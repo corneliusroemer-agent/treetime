@@ -303,6 +303,22 @@ class UnrootedBaseline:
             tt.set_root_state_messages(self.root_state_messages)
         return tt
 
+    def make_treeanc(self, tree, messages=True):
+        """New TreeAnc on ``tree`` for scoring at fixed branch lengths: same
+        alignment, model and seed, the data-defining constructor settings of
+        ``tt_kwargs`` (e.g. ``seq_len`` for added constant sites) and, unless
+        ``messages=False``, the baseline's root-state messages."""
+        import inspect
+        from .treeanc import TreeAnc
+        allowed = set(inspect.signature(TreeAnc.__init__).parameters) - {'self', 'tree', 'aln', 'gtr', 'kwargs'}
+        kw = {k: v for k, v in self.tt_kwargs.items() if k in allowed}
+        kw.setdefault('verbose', 0)
+        kw.setdefault('rng_seed', self.rng_seed)
+        ta = TreeAnc(tree=tree, aln=self.aln, gtr=copy.deepcopy(self.gtr), **kw)
+        if messages and self.root_state_messages is not None:
+            ta.set_root_state_messages(self.root_state_messages)
+        return ta
+
     def with_root_state_messages(self, messages):
         """Copy of this baseline (same topology, branch lengths, model and clock
         rate) whose candidate fits carry external root-state likelihoods
@@ -379,12 +395,11 @@ def fitted_newick(tt):
 
 def score_newick(baseline, newick):
     """Marginal log-likelihood of the baseline alignment on a tree given as a
-    newick string, at exactly its branch lengths, with a new TreeAnc object."""
-    from .treeanc import TreeAnc
+    newick string, at exactly its branch lengths, with a new TreeAnc object
+    (:meth:`UnrootedBaseline.make_treeanc`: the baseline's data settings and its
+    root-state messages, if any)."""
     tree = Phylo.read(io.StringIO(newick), 'newick')
-    ta = TreeAnc(tree=tree, aln=baseline.aln, gtr=copy.deepcopy(baseline.gtr), verbose=0,
-                 rng_seed=baseline.rng_seed)
-    return fresh_marginal_score(ta)
+    return fresh_marginal_score(baseline.make_treeanc(tree))
 
 
 def classify_trajectory(scores, tol=1e-6):

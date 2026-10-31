@@ -263,3 +263,31 @@ def test_root_edges_fitted_separately_with_messages(b20, fitted):
             return -fresh_marginal_score(tt2)
         t_brute = minimize_scalar(neg, bounds=(1e-6, 1.0), method='bounded', options={'xatol': 1e-9}).x
         assert t_marg == pytest.approx(t_brute, rel=2e-3, abs=2e-5)
+
+
+def test_independent_scorers_keep_messages_and_data_settings():
+    """score_newick and score_tree_with_messages use the baseline's data
+    settings (here 20 added constant columns via seq_len) and score_newick the
+    baseline's messages, including messages on the added columns."""
+    import io
+    from Bio import Phylo
+    from treetime.root_candidates import fitted_newick, score_newick
+    from treetime.root_messages import score_tree_with_messages
+    nwk, aln, dates, meta = load('binary20')
+    plain = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    L0 = plain.make_treeanc(plain.rooted_phylo(None)).data.full_length
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69', tt_kwargs=dict(seq_len=L0 + 20))
+    true = b.canonical(EdgeRoot(frozenset(meta['true_root_split']), 0.5))
+    run = evaluate_root_candidate(b, true, FitConfig(iterations=1))
+    assert run.state.data.full_length == L0 + 20
+    o = run.state.tree.root._cseq[run.state.data.full_to_compressed_sequence_map]
+    m = outgroup_leaf_messages(run.state.gtr, o, 0.05)
+    m[L0 + 3] = [0.9, 0.05, 0.02, 0.02, 0.01]  # an added constant column with its own message
+    nw = fitted_newick(run.state)
+    tree = Phylo.read(io.StringIO(nw), 'newick')
+    expect = root_message_correction(b.make_treeanc(copy.deepcopy(tree)), m)
+    assert b.make_treeanc(copy.deepcopy(tree)).data.full_length == L0 + 20
+    assert score_newick(b, nw) == pytest.approx(expect['ingroup'], abs=1e-8)
+    assert score_newick(b.with_root_state_messages(m), nw) == pytest.approx(expect['combined'], abs=1e-8)
+    assert score_tree_with_messages(b, tree, m)[0] == pytest.approx(expect['combined'], abs=1e-8)
+    assert score_newick(plain, nw) != pytest.approx(expect['ingroup'], abs=1e-3)  # the added columns count

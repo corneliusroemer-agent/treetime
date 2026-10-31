@@ -165,9 +165,7 @@ def score_tree_with_messages(baseline, tree, messages):
     """Combined marginal log-likelihood of the baseline alignment on a rooted
     Bio.Phylo ``tree`` at exactly its branch lengths, messages at its root
     (2b representation: refined patterns). Returns (combined, ingroup, correction)."""
-    from .treeanc import TreeAnc
-    ta = TreeAnc(tree=copy.deepcopy(tree), aln=baseline.aln, gtr=copy.deepcopy(baseline.gtr), verbose=0,
-                 rng_seed=baseline.rng_seed)
+    ta = baseline.make_treeanc(copy.deepcopy(tree), messages=False)  # the baseline's data settings
     ta.set_root_state_messages(messages)
     s = fresh_marginal_score(ta)
     return s, float(ta.tree.total_sequence_LH_ingroup), float(ta.tree.total_root_message_LH)
