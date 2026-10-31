@@ -136,12 +136,12 @@ def subtree(fx, nwk=OG_NWK, **kw):
     return OutgroupSubtree(fx['b'].gtr, fx['ogs'], tree=og_tree(nwk) if nwk else None, stem=STEM, **kw)
 
 
-def message_score(fx, og, lengths=None, eps=0.0):
+def message_score(fx, og, lengths=None):
     """(grouped sidecar at the fitted state, refined patterns on a TreeAnc) combined scores."""
     g = og.state_groups(copy.deepcopy(fx['tt']))
-    s_side = og.combined_at_state(g, lengths, eps)
+    s_side = og.combined_at_state(g, lengths)
     ta = fx['b'].make_treeanc(copy.deepcopy(fx['tree']), messages=False)
-    ta.set_root_state_messages(og.root_messages(lengths, eps, ta.data.full_length))
+    ta.set_root_state_messages(og.root_messages(lengths, ta.data.full_length))
     return s_side, fresh_marginal_score(ta)
 
 
@@ -177,7 +177,7 @@ def test_star_default_and_compression(fx):
     # compression: refined patterns = (ingroup pattern, outgroup pattern), never the full alignment
     ta = fx['b'].make_treeanc(copy.deepcopy(fx['tree']), messages=False)
     n0 = ta.data.compressed_length
-    ta.set_root_state_messages(og.root_messages(th, 0.0, ta.data.full_length))
+    ta.set_root_state_messages(og.root_messages(th, ta.data.full_length))
     pairs = {(int(p), int(o)) for p, o in zip(fx['tt'].data.full_to_compressed_sequence_map, og.pattern)
              if not og.neutral[o]}
     assert n0 <= ta.data.compressed_length < fx['L']
@@ -244,19 +244,6 @@ def test_missing_states(fx):
     assert abs(s - s_b) < TOL
 
 
-def test_eps_zero_identical_and_mixture(fx):
-    og = subtree(fx)
-    assert np.array_equal(og.message_table(eps=0.0), og.message_table())
-    e = 0.05
-    m, m0, c = og.message_table(eps=e), og.message_table(), og.uninformative_table()
-    obs = ~og.neutral
-    assert np.allclose(m[obs], (1 - e) * m0[obs] + e * c[obs], rtol=1e-14)
-    assert np.all(m[og.neutral] == 1.0)
-    # the mixture is a likelihood: score against brute force on a per-site mixture of two stems
-    s = message_score(fx, og, eps=e)
-    assert abs(s[0] - s[1]) < TOL
-
-
 def test_outgroup_lengths_do_not_touch_ingroup_clock(fx):
     og = subtree(fx)
     g = og.state_groups(copy.deepcopy(fx['tt']))
@@ -267,7 +254,7 @@ def test_outgroup_lengths_do_not_touch_ingroup_clock(fx):
     tt = copy.deepcopy(fx['tt'])
     ing0 = fresh_marginal_score(tt)
     for t in (og.lengths, th):
-        tt.set_root_state_messages(og.root_messages(t, 0.0, tt.data.full_length))
+        tt.set_root_state_messages(og.root_messages(t, tt.data.full_length))
         fresh_marginal_score(tt)
         assert abs(tt.tree.total_sequence_LH_ingroup - ing0) < TOL
     assert not ({'OG1', 'OG2', 'OG3'} & {n.name for n in tt.tree.get_terminals()})

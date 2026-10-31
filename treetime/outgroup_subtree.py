@@ -21,15 +21,6 @@ compressed patterns by (ingroup pattern, outgroup pattern), which is the grouped
 form sum_{g,o} n_{g,o} log sum_a pi_a l_g(a) m_o(a). The full alignment is never
 expanded.
 
-Site-wise mixture ``eps`` (default 0, off): m'_i(a) = (1 - eps) m_i(a) + eps c_i
-with c_i = sum_b pi_b L_X,i(b), the d -> infinity limit of m_i. It is a proper
-likelihood, but **not a cap on the outgroup's pull**: any per-site mixture whose
-second component does not depend on the root state is a stem change plus a
-candidate-independent constant. Under F81/JC, e^{Qt} = e^{-mu t} I +
-(1 - e^{-mu t}) 1 pi^T is affine in e^{-mu t}, so the mixture is exactly a
-longer stem; under GTR approximately. With the stem fitted per candidate, eps
-therefore acts only as a minimum effective stem length.
-
 Attachment mixture (post hoc, :func:`attachment_mixture_scores`): the outgroup
 attaches at the candidate root with probability 1 - w and, with probability w,
 uniformly at one of the neighbouring attachment points. This is the
@@ -252,19 +243,12 @@ class OutgroupSubtree:
             lik[v] = acc
         return lik[0]
 
-    def message_table(self, lengths=None, eps=0.0):
+    def message_table(self, lengths=None):
         """Messages per outgroup pattern, (n_patterns, n_states), absolute
-        scale; neutral patterns are exactly 1. ``eps``: site-wise mixture
-        with the uninformative message c = sum_b pi_b L_X(b), equivalent to a
-        longer stem (see the module docstring), default off."""
+        scale; neutral patterns are exactly 1."""
         th = self._check(lengths)
         lx = self.conditional(th)
         m = lx @ self.gtr.expQt(th[0])  # single leaf at X: the expression of outgroup_leaf_messages
-        if eps:
-            if not 0 < eps < 1:
-                raise ValueError('OutgroupSubtree: eps must be in [0, 1)')
-            c = lx @ np.asarray(self.gtr.Pi, dtype=float)
-            m = (1.0 - eps) * m + eps * c[:, None]
         m[self.neutral] = 1.0
         return m
 
@@ -275,7 +259,7 @@ class OutgroupSubtree:
         c[self.neutral] = 1.0
         return np.repeat(c[:, None], len(self.gtr.alphabet), axis=1)
 
-    def root_messages(self, lengths=None, eps=0.0, full_length=None):
+    def root_messages(self, lengths=None, full_length=None):
         """:class:`PatternMessages` for :meth:`TreeAnc.set_root_state_messages`;
         positions beyond the outgroup alignment (``full_length`` longer) are neutral."""
         pat = self.pattern
@@ -283,11 +267,11 @@ class OutgroupSubtree:
             if full_length < self.length:
                 raise ValueError('OutgroupSubtree: outgroup alignment longer than the ingroup one')
             pat = np.concatenate([pat, -np.ones(full_length - self.length, dtype=int)])
-        return PatternMessages(pattern=pat, table=self.message_table(lengths, eps))
+        return PatternMessages(pattern=pat, table=self.message_table(lengths))
 
-    def full_messages(self, lengths=None, eps=0.0):
+    def full_messages(self, lengths=None):
         """Uncompressed (L, n_states) message array (tests and diagnostics)."""
-        return self.message_table(lengths, eps)[self.pattern]
+        return self.message_table(lengths)[self.pattern]
 
     # -- fit at a fixed ingroup state ----------------------------------------
     def state_groups(self, tt):
@@ -308,12 +292,12 @@ class OutgroupSubtree:
         groups, counts = np.unique(np.stack([cpat, self.pattern[pos]]), axis=1, return_counts=True)
         return {'w': w[groups[0]], 'og': groups[1], 'n': counts.astype(float), 'ingroup': ingroup}
 
-    def combined_at_state(self, groups, lengths=None, eps=0.0):
+    def combined_at_state(self, groups, lengths=None):
         """Combined log-likelihood (ingroup + outgroup) at a fixed ingroup state."""
-        m = self.message_table(lengths, eps)
+        m = self.message_table(lengths)
         return groups['ingroup'] + float(np.sum(groups['n'] * np.log(np.sum(groups['w'] * m[groups['og']], axis=1))))
 
-    def optimise_lengths(self, tt_or_groups, lengths=None, eps=0.0, max_sweeps=30, xatol=1e-7, ftol=1e-10):
+    def optimise_lengths(self, tt_or_groups, lengths=None, max_sweeps=30, xatol=1e-7, ftol=1e-10):
         """Maximise the combined likelihood over the outgroup branch lengths at a
         fixed ingroup state: coordinate ascent, each step a bounded Brent search
         on log length. Returns (lengths, combined, sweeps)."""
@@ -322,7 +306,7 @@ class OutgroupSubtree:
         th = self._check(lengths).copy()
         lo, hi = np.log(self.bounds[0]), np.log(self.bounds[1])
         th = np.clip(th, *self.bounds)
-        cur = self.combined_at_state(g, th, eps)
+        cur = self.combined_at_state(g, th)
         sweeps = 0
         for sweeps in range(1, max_sweeps + 1):
             moved, start = 0.0, cur
@@ -330,7 +314,7 @@ class OutgroupSubtree:
                 def neg(x, j=j):
                     t = th.copy()
                     t[j] = np.exp(x)
-                    return -self.combined_at_state(g, t, eps)
+                    return -self.combined_at_state(g, t)
                 r = minimize_scalar(neg, bounds=(lo, hi), method='bounded', options={'xatol': xatol})
                 if -r.fun > cur:
                     moved = max(moved, abs(r.x - np.log(th[j])))
@@ -355,7 +339,7 @@ class OutgroupCandidateResult(CandidateResult):
         return float(max(sc) - min(sc)) if len(sc) > 1 else None
 
 
-def fit_outgroup_candidate(baseline, stage1_result, outgroup, eps=0.0, fit=None, optimise_lengths=True, rounds=3,
+def fit_outgroup_candidate(baseline, stage1_result, outgroup, fit=None, optimise_lengths=True, rounds=3,
                            cold_start=False, lengths=None, keep_state=True, catch_errors=False, tol=1e-6):
     """Stage 3 fit of one candidate, starting from its Stage 1 result.
 
@@ -389,13 +373,13 @@ def fit_outgroup_candidate(baseline, stage1_result, outgroup, eps=0.0, fit=None,
     th = np.array(outgroup.lengths if lengths is None else lengths, dtype=float)
     diag = {'theta_in': th.tolist(), 'posthoc': None, 'round_scores': [], 'round_thetas': [], 'stop': None}
     if optimise_lengths:
-        th, val, _ = outgroup.optimise_lengths(copy.deepcopy(b1.state), th, eps)
+        th, val, _ = outgroup.optimise_lengths(copy.deepcopy(b1.state), th)
     else:
-        val = outgroup.combined_at_state(outgroup.state_groups(copy.deepcopy(b1.state)), th, eps)
+        val = outgroup.combined_at_state(outgroup.state_groups(copy.deepcopy(b1.state)), th)
     diag['posthoc'] = val  # Stage 1 fit, outgroup lengths fitted, no propagation ("3a")
 
     def run_with(theta, rnd, initial_state=None, mu=None, cand=None, mode=None):
-        b = baseline.with_root_state_messages(outgroup.root_messages(theta, eps, full))
+        b = baseline.with_root_state_messages(outgroup.root_messages(theta, full))
         cfg = fit if mode is None else FitConfig(fit.iterations, mode)
         x = evaluate_root_candidate(b, cand if cand is not None else r1.candidate, cfg, keep_state=keep_state,
                                     catch_errors=catch_errors, clock_rate=mu, initial_state=initial_state)
@@ -416,7 +400,7 @@ def fit_outgroup_candidate(baseline, stage1_result, outgroup, eps=0.0, fit=None,
         if best.error is not None or best.state is None:
             diag['stop'] = 'no state'
             break
-        th_new, val, _ = outgroup.optimise_lengths(copy.deepcopy(best.state), best.outgroup_lengths, eps)
+        th_new, val, _ = outgroup.optimise_lengths(copy.deepcopy(best.state), best.outgroup_lengths)
         if val - best.best_score < tol:
             diag['stop'] = 'converged'
             break
@@ -442,12 +426,11 @@ class Stage3Result:
     extra: list = field(default_factory=list)       # OutgroupCandidateResult of extra candidates (not ranked)
     extra_rows: list = field(default_factory=list)
     extra_stage1: object = None
-    eps: float = 0.0
 
     def summary(self):
         return {'stage1_best': self.stage1.best.candidate_id, 'stage1_margin': self.stage1.margin,
                 'stage3_best': self.stage3.best.candidate_id, 'stage3_margin': self.stage3.margin,
-                'stage3_resolved': self.stage3.best_is_resolved, 'eps': self.eps}
+                'stage3_resolved': self.stage3.best_is_resolved}
 
     def to_tsv(self, path):
         cols = list(self.rows[0].keys()) if self.rows else []
@@ -479,7 +462,7 @@ def _row(outgroup, r1, r3, diag, extra=False):
     return row
 
 
-def rank_with_outgroup(baseline, outgroup, eps=0.0, explicit=(), regression_k=5, attachment=(), attach_k=3,
+def rank_with_outgroup(baseline, outgroup, explicit=(), regression_k=5, attachment=(), attach_k=3,
                        optimise_lengths=True, rounds=3, cold_start=False, lengths=None, stage1=None,
                        extra_candidates=(), fit=None, min_margin=1.0, catch_errors=False, keep_states=True,
                        **rank_kwargs):
@@ -500,7 +483,7 @@ def rank_with_outgroup(baseline, outgroup, eps=0.0, explicit=(), regression_k=5,
     only: they never enter the ranking, the margin or the verdict.
 
     With one outgroup leaf, ``optimise_lengths=False``, ``lengths=[d]``,
-    ``cold_start=True`` and ``eps=0`` this is Stage 2b at fixed d.
+    ``cold_start=True`` this is Stage 2b at fixed d.
     """
     fit = fit or FitConfig()
     if rank_kwargs.get('rate_rounds') or rank_kwargs.get('sensitivity_window') is not None:
@@ -515,7 +498,7 @@ def rank_with_outgroup(baseline, outgroup, eps=0.0, explicit=(), regression_k=5,
         stage1 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, fit=fit,
                                       min_margin=min_margin, catch_errors=catch_errors, keep_states=True,
                                       **rank_kwargs)
-    kw = dict(eps=eps, fit=fit, optimise_lengths=optimise_lengths, rounds=rounds, cold_start=cold_start,
+    kw = dict(fit=fit, optimise_lengths=optimise_lengths, rounds=rounds, cold_start=cold_start,
               lengths=lengths, keep_state=keep_states, catch_errors=catch_errors)
     results, rows = [], []
     for r1 in stage1.results:
@@ -526,11 +509,11 @@ def rank_with_outgroup(baseline, outgroup, eps=0.0, explicit=(), regression_k=5,
         r3, diag = fit_outgroup_candidate(baseline, r1, outgroup, **kw)
         results.append(r3)
         rows.append(_row(outgroup, r1, r3, diag))
-    s3 = finalise_ranking(results, min_margin, config={'eps': eps, 'rounds': rounds, 'optimise_lengths':
+    s3 = finalise_ranking(results, min_margin, config={'rounds': rounds, 'optimise_lengths':
                                                        optimise_lengths, 'cold_start': cold_start,
                                                        'iterations': fit.iterations, 'n_outgroups':
                                                        len(outgroup.sequences)}, clock_rate=baseline.clock_rate)
-    out = Stage3Result(stage1=stage1, stage3=s3, rows=rows, eps=eps)
+    out = Stage3Result(stage1=stage1, stage3=s3, rows=rows)
     if extra_candidates:
         s1x = rank_root_candidates(baseline, explicit=list(extra_candidates), regression_k=0, fit=fit,
                                    candidate_sources=(), min_margin=min_margin, catch_errors=catch_errors,
@@ -585,7 +568,7 @@ def _rooted_on_edge(adj, names, a, b, frac=0.5):
     return Tree(root=root, rooted=True)
 
 
-def attachment_mixture_scores(baseline, tt, outgroup, ws=(0.0, 0.1, 0.3, 0.5), eps=0.0, lengths=None):
+def attachment_mixture_scores(baseline, tt, outgroup, ws=(0.0, 0.1, 0.3, 0.5), lengths=None):
     """Post-hoc attachment mixture at a fitted ingroup state ``tt`` rooted at the
     candidate R (no messages of its own needed; its ingroup part is used).
 
@@ -601,12 +584,12 @@ def attachment_mixture_scores(baseline, tt, outgroup, ws=(0.0, 0.1, 0.3, 0.5), e
     if base.root_state_message is not None:
         base.set_root_state_messages(None)
     th0 = outgroup.lengths if lengths is None else lengths
-    th_r, s_r, _ = outgroup.optimise_lengths(base, th0, eps)
+    th_r, s_r, _ = outgroup.optimise_lengths(base, th0)
     adj, names, nb = _unrooted_from_state(base)
     s_nb = []
     for a, b in nb:
         ta = baseline.make_treeanc(_rooted_on_edge(adj, names, a, b), messages=False)
-        s_nb.append(outgroup.optimise_lengths(ta, th_r, eps)[1])
+        s_nb.append(outgroup.optimise_lengths(ta, th_r)[1])
     out = {}
     for w in ws:
         if w == 0 or not s_nb:
