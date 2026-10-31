@@ -217,9 +217,10 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
        given ``stage1`` result).
     2. 2a: every Stage 1 candidate's best fitted state is scored post hoc with
        the messages (:func:`root_message_correction`).
-    3. 2b: :func:`rank_root_candidates` on a :class:`RootMessageBaseline` over
-       exactly the Stage 1 candidates (explicit, no new regression candidates),
-       so fits, rate fits and sensitivity refits all see the messages.
+    3. 2b: :func:`rank_root_candidates` on a :class:`RootMessageBaseline` with the
+       same ``explicit``/``regression_k`` (a given ``stage1`` must have been run
+       with them), so the candidates and their initialisations are Stage 1's,
+       and fits, rate fits and sensitivity refits all see the messages.
 
     Per-candidate rows: ingroup-only, correction and combined at the Stage 1 fit
     (2a); the same three at the refitted 2b state; the refitted-minus-post-hoc
@@ -228,12 +229,10 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
     """
     if stage1 is None:
         stage1 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, **rank_kwargs)
-    cands = [r.candidate for r in stage1.results]
-    mb = RootMessageBaseline(baseline, messages)
-    kw = dict(rank_kwargs)
-    kw['rate_fit_extra'] = list(kw.get('rate_fit_extra', ())) + [r.candidate for r in stage1.results
-                                                                 if r.regression_rank == 1]
-    s2b = rank_root_candidates(mb, explicit=cands, regression_k=0, **kw)
+    # same explicit and regression candidates (RootMessageBaseline.regression is the ingroup
+    # regression), hence the same candidates and initialisations as Stage 1
+    s2b = rank_root_candidates(RootMessageBaseline(baseline, messages), explicit=explicit,
+                               regression_k=regression_k, **rank_kwargs)
     by2b = {r.candidate_id: r for r in s2b.results}
     rows = []
     pos = list(posterior_positions)
