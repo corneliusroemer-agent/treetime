@@ -37,7 +37,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .root_candidates import candidate_key, rank_root_candidates, restore_best_fitted_state, fresh_marginal_score
+from .root_candidates import (candidate_key, format_source_ranks, rank_root_candidates, restore_best_fitted_state,
+                              fresh_marginal_score)
 from .seq_utils import normalize_profile, seq2prof
 
 
@@ -210,13 +211,47 @@ def _root_edges(tt):
     return sorted((c.name, float(c.branch_length)) for c in tt.tree.root.clades)
 
 
+def attachment_candidates(baseline, outgroups):
+    """Outgroup-attachment scan: every placement of the unrooted ``baseline``
+    is rooted at the baseline branch lengths, and each outgroup leaf's branch
+    length d is fitted by ML there (:func:`estimate_outgroup_distance`).
+
+    ``outgroups``: ``{name: sequence}``. The outgroup used is the one with the
+    smallest d at its own best placement (a single-leaf message). Returns
+    ``(candidates, outgroup_name, d_hat)``: that outgroup's placements, best
+    combined score first, and its ML d at the best one. Pass
+    ``candidates`` as ``attachment`` and ``outgroup_leaf_messages(gtr,
+    outgroups[outgroup_name], d_hat)`` as the messages to
+    :func:`rank_with_root_messages`. Costs one TreeAnc per placement.
+    """
+    if not outgroups:
+        raise ValueError('attachment_candidates: no outgroup sequences')
+    names = list(outgroups)
+    scan = {n: [] for n in names}
+    for i, c in enumerate(baseline.all_candidates()):
+        ta = baseline.make_treeanc(baseline.rooted_phylo(c), messages=False)
+        for n in names:
+            d, comb = estimate_outgroup_distance(ta, outgroups[n])
+            scan[n].append((-comb, i, d, c))
+    for n in names:
+        scan[n].sort(key=lambda r: r[:2])
+    og = min(names, key=lambda n: scan[n][0][2])
+    return [r[3] for r in scan[og]], og, scan[og][0][2]
+
+
 def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, posterior_positions=(), stage1=None,
-                            warm_start=True, **rank_kwargs):
+                            warm_start=True, attachment=(), attach_k=3, **rank_kwargs):
     """Stage 1, 2a and 2b on one candidate set.
+
+    Candidates: ``explicit``, the first ``attach_k`` placements of
+    ``attachment`` (best first, e.g. from :func:`attachment_candidates`; source
+    label 'attach') and the regression sources of :func:`rank_root_candidates`
+    (``regression_k`` and ``candidate_sources``/``covariation``/``tip_slack``
+    in ``rank_kwargs``; default plain top 5 + covariation top 5).
 
     1. Stage 1: :func:`rank_root_candidates` on the ingroup ``baseline`` (or the
        given ``stage1`` result, which must have been run with the same
-       ``explicit``/``regression_k`` and must have kept its states).
+       candidate arguments and must have kept its states).
     2. 2a: every Stage 1 candidate's best fitted state is scored post hoc with
        the messages (:func:`root_message_correction`).
     3. 2b: :func:`rank_root_candidates` on
@@ -236,6 +271,10 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
     # 2a and the warm starts need the fitted states: keep them until the rows are built,
     # then drop them if the caller asked for keep_states=False
     keep = rank_kwargs.pop('keep_states', True)
+    if 'ranked_sources' in rank_kwargs:
+        raise ValueError('rank_with_root_messages: pass attachment candidates as attachment=')
+    attach = list(attachment)[:attach_k] if attach_k else []
+    rank_kwargs['ranked_sources'] = {'attach': attach} if attach else None
     if stage1 is None:
         stage1 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, keep_states=True,
                                       **rank_kwargs)
@@ -255,7 +294,8 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
     rows = []
     pos = list(posterior_positions)
     for r1 in stage1.results:
-        row = {'candidate_id': r1.candidate_id, 'source': r1.source, 'regression_rank': r1.regression_rank,
+        row = {'candidate_id': r1.candidate_id, 'source': r1.source,
+               'source_ranks': format_source_ranks(r1.source_ranks), 'regression_rank': r1.regression_rank,
                'ingroup_1': r1.score}
         try:
             tt1 = copy.deepcopy(restore_best_fitted_state(r1))

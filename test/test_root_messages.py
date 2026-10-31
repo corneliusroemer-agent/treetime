@@ -11,8 +11,10 @@ import pytest
 
 from test_root_candidates import load
 from treetime.root_candidates import EdgeRoot, FitConfig, UnrootedBaseline, evaluate_root_candidate, fresh_marginal_score
-from treetime.root_messages import (estimate_outgroup_distance, ingroup_root_posterior, outgroup_leaf_messages,
-                                    rank_with_root_messages, root_message_correction, root_state_posterior)
+from treetime.root_candidates import candidate_key, plain_candidate_sources
+from treetime.root_messages import (attachment_candidates, estimate_outgroup_distance, ingroup_root_posterior,
+                                    outgroup_leaf_messages, rank_with_root_messages, root_message_correction,
+                                    root_state_posterior)
 from treetime.treeanc import TreeAnc
 
 FIT = FitConfig(iterations=2)
@@ -309,3 +311,30 @@ def test_rank_with_root_messages_keep_states_false(b20, fitted):
     s1 = rank_root_candidates(b, keep_states=False, **kw)
     with pytest.raises(ValueError):
         rank_with_root_messages(b, m, stage1=s1, **kw)
+
+
+def test_attachment_candidates_and_attach_k(b20, fitted):
+    """The attachment scan ranks every placement for the outgroup with the smallest ML d;
+    rank_with_root_messages adds its first attach_k placements, labelled 'attach' with their rank,
+    to the regression shortlist (here plain top 2), deduplicated by bipartition."""
+    b, true = b20
+    tt = fitted.state
+    full = tt.data.full_to_compressed_sequence_map
+    near = ''.join(tt.tree.root._cseq[full])
+    far = ''.join('A' if ch != 'A' else 'C' for ch in near[:40]) + near[40:]
+    cands, og, d = attachment_candidates(b, {'far': far, 'near': near})
+    assert og == 'near' and 0 < d < 0.05
+    assert len(cands) == len(b.all_candidates()) and len({candidate_key(c) for c in cands}) == len(cands)
+    msg = outgroup_leaf_messages(b.gtr, near, d)
+    kw = dict(candidate_sources=plain_candidate_sources(2), fit=FitConfig(0), sensitivity_window=None, rate_rounds=0,
+              warm_start=False, keep_states=False)
+    for k in (0, 2, 3):
+        res = rank_with_root_messages(b, msg, attachment=cands, attach_k=k, **kw)
+        ranks = sorted(r.source_ranks['attach'] for r in res.stage1.results if 'attach' in r.source_ranks)
+        assert ranks == list(range(1, k + 1))
+        keys = {candidate_key(c) for c in cands[:k]} | {candidate_key(r.candidate) for r in res.stage1.results
+                                                        if 'plain' in r.source_ranks}
+        assert {candidate_key(r.candidate) for r in res.stage1.results} == keys
+        assert len(res.rows) == len(keys)
+        assert {candidate_key(r.candidate) for r in res.stage2b.results} == keys
+        assert all(row['source_ranks'] for row in res.rows)
