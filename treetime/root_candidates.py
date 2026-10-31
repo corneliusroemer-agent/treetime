@@ -643,21 +643,39 @@ def restore_best_fitted_state(run):
 # --------------------------------------------------------------------------
 # candidate generation
 # --------------------------------------------------------------------------
+def _regression_edges(baseline, covariation=False, tip_slack=None, slope='fixed'):
+    """Every edge the regression ranks (finite objective, positive slope), best
+    first, as ``(edge split, fraction, rank_roots entry, objective at the edge
+    midpoint)``. ``fraction`` follows :class:`EdgeRoot`'s convention."""
+    from .treeregression import base_regression
+    treg = baseline.regression(covariation=covariation, tip_slack=tip_slack)
+    s = baseline.clock_rate if slope == 'fixed' else slope
+    out = []
+    for p in treg.rank_roots(force_positive=True, slope=s):
+        nd = p['node']
+        if nd.name == baseline.ref_leaf:
+            split, frac = baseline.split_of[baseline.center], 1.0 - p['split']
+        else:
+            split, frac = baseline.split_of[nd.name], p['split']
+        tv, bv, var = treg.tip_value(nd), treg.branch_value(nd), treg.branch_variance(nd)
+        q = (treg.propagate_averages(nd, tv, bv * 0.5, var * 0.5)
+             + treg.propagate_averages(nd, tv, bv * 0.5, var * 0.5, outgroup=True))
+        out.append((split, frac, p, float(base_regression(q, slope=s)['chisq'])))
+    return out
+
+
 def regression_candidates(baseline, k=5, covariation=False, tip_slack=None, slope='fixed'):
     """Best ``k`` distinct placements of the root-to-tip regression as canonical
     candidates, best first, each as ``(candidate, info)`` with the regression
     rank, objective and split. ``slope='fixed'`` uses the baseline clock rate;
     ``None`` lets the regression fit its own slope."""
-    treg = baseline.regression(covariation=covariation, tip_slack=tip_slack)
-    s = baseline.clock_rate if slope == 'fixed' else slope
+    return _distinct_placements(baseline, _regression_edges(baseline, covariation, tip_slack, slope), k)
+
+
+def _distinct_placements(baseline, edges, k):
     out, seen = [], set()
-    for p in treg.rank_roots(force_positive=True, slope=s):
-        n = p['node'].name
-        if n == baseline.ref_leaf:
-            cand = EdgeRoot(baseline.split_of[baseline.center], 1.0 - p['split'])
-        else:
-            cand = EdgeRoot(baseline.split_of[n], p['split'])
-        cand = baseline.canonical(cand)
+    for split, frac, p, _ in edges:
+        cand = baseline.canonical(EdgeRoot(split, frac))
         if candidate_key(cand) in seen:
             continue
         seen.add(candidate_key(cand))
@@ -668,30 +686,89 @@ def regression_candidates(baseline, k=5, covariation=False, tip_slack=None, slop
     return out
 
 
+def node_incident_edges(baseline, node, edges, n=None):
+    """Up to ``n`` (``None``: all) edges incident to the internal node of
+    ``node`` (a :class:`NodeRoot`), as midpoint :class:`EdgeRoot` candidates,
+    best first by the regression objective at the edge midpoint (from
+    ``edges``, :func:`_regression_edges`; edges it does not rank come last).
+    Zero-length edges are skipped: a root on one is the node itself.
+
+    A regression optimum at an edge endpoint is rounded to that node, and a
+    node candidate's fit never leaves the node, so without this the edges next
+    to a node optimum are never fitted."""
+    mid = {split: m for split, _, _, m in edges}
+    v = baseline.node_of[node.split]
+    out = []
+    for w, length in baseline.adj[v].items():
+        if length > 0:
+            split = baseline.split_of[v] if baseline.toward_ref.get(v) == w else baseline.split_of[w]
+            out.append((mid.get(split, np.inf), sorted(split), split))
+    out.sort(key=lambda e: e[:2])
+    return [baseline.canonical(EdgeRoot(split, 0.5)) for _, _, split in out[:n]]
+
+
 @dataclass(frozen=True)
 class RegressionSource:
     """One regression shortlist: the best ``k`` placements of
     :func:`regression_candidates` with these arguments, labelled ``name``
-    (``k=None``: every placement)."""
+    (``k=None``: every placement).
+
+    ``node_edges`` expands each node candidate (ranked at most
+    ``node_edges_max_rank``) into its incident edges (:func:`node_incident_edges`):
+    0 = off, ``n`` = the ``n`` best by the midpoint objective, ``None`` = all.
+    A regression optimum at an edge endpoint is rounded to the node, and the
+    regression cannot tell which incident edge holds the root (in report 46 the
+    midpoint objective picked the true edge about as often as chance), so
+    ``None`` is the useful setting; it roughly doubles the shortlist, hence
+    off by default."""
 
     name: str
     k: Optional[int] = 5
     covariation: bool = False
     tip_slack: Optional[float] = None
     slope: object = 'fixed'
+    node_edges: Optional[int] = 0  # per node candidate, add this many incident edges (None: all); label '<name>_adj'
+    node_edges_max_rank: Optional[int] = None  # expand only node candidates ranked <= this (None: every one)
 
     def candidates(self, baseline):
-        return regression_candidates(baseline, k=self.k, covariation=self.covariation, tip_slack=self.tip_slack,
-                                     slope=self.slope)
+        return self.candidates_and_expansions(baseline)[0]
+
+    def candidates_and_expansions(self, baseline):
+        """``(candidates, expansions)``: the source's ``(candidate, info)`` list,
+        and ``[(edge candidate, rank of the node it expands)]`` from
+        :func:`node_incident_edges` for each node candidate (empty when
+        ``node_edges`` is 0)."""
+        edges = _regression_edges(baseline, self.covariation, self.tip_slack, self.slope)
+        cands = _distinct_placements(baseline, edges, self.k)
+        exp = []
+        if self.node_edges is None or self.node_edges > 0:
+            for c, info in cands:
+                if isinstance(c, NodeRoot) and (self.node_edges_max_rank is None
+                                                or info['regression_rank'] <= self.node_edges_max_rank):
+                    exp += [(e, info['regression_rank']) for e in node_incident_edges(baseline, c, edges,
+                                                                                      self.node_edges)]
+        return cands, exp
 
 
-def default_candidate_sources(k=5):
-    """The default shortlist: plain root-to-tip regression at the baseline's
-    fixed rate, top ``k``, and covariation regression (tip_slack 3, free slope),
-    top ``k``. On simulated benchmarks the true root was often off the plain
-    list alone and on the covariation list (investigation report 35)."""
-    return (RegressionSource('plain', k),
-            RegressionSource('cov', k, covariation=True, tip_slack=3.0, slope=None))
+DEFAULT_NODE_EDGES = 0
+
+
+def default_candidate_sources(k=5, node_edges=DEFAULT_NODE_EDGES):
+    """The default shortlist without an outgroup: plain root-to-tip regression
+    at the baseline's fixed rate, top ``k``, and covariation regression
+    (tip_slack 3, free slope), top ``k``. On simulated benchmarks the true root
+    was often off the plain list alone and on the covariation list
+    (investigation reports 35, 45). ``node_edges``: see :class:`RegressionSource`."""
+    return (RegressionSource('plain', k, node_edges=node_edges),
+            RegressionSource('cov', k, covariation=True, tip_slack=3.0, slope=None, node_edges=node_edges))
+
+
+def outgroup_candidate_sources(k=5, node_edges=DEFAULT_NODE_EDGES):
+    """The regression part of the default shortlist when outgroup-attachment
+    candidates are added (Stage 2): covariation regression (tip_slack 3, free
+    slope), top ``k``; with the attachment top 3 the plain list added no
+    recall (investigation report 45)."""
+    return (RegressionSource('cov', k, covariation=True, tip_slack=3.0, slope=None, node_edges=node_edges),)
 
 
 def plain_candidate_sources(k=5):
@@ -728,6 +805,10 @@ def candidate_shortlist(baseline, explicit=(), sources=None, ranked_sources=None
     placements each add an initialisation; of the regression sources, only the
     first one to propose a candidate adds its placement, as the first
     initialisation, so a candidate on several regression lists is fitted once.
+    Last come the node expansions of every regression source
+    (``RegressionSource.node_edges``, label '<name>_adj', rank = the rank of
+    the node they expand); they start at the edge midpoint and add no
+    initialisation to a candidate that is already listed.
     Returns ``{candidate_key: ShortlistEntry}``.
     """
     merged = {}
@@ -745,14 +826,16 @@ def candidate_shortlist(baseline, explicit=(), sources=None, ranked_sources=None
 
     add_listed('explicit', explicit)
     for name, cands in (ranked_sources or {}).items():
-        if name == 'explicit' or any(name == s.name for s in sources or ()):
-            raise ValueError('candidate source name %r is used twice' % name)
+        if name == 'explicit':
+            raise ValueError("candidate source name 'explicit' is reserved")
         add_listed(name, cands)
     names = [s.name for s in sources or ()]
-    if len(set(names)) != len(names):
-        raise ValueError('regression source names must be distinct: %s' % names)
-    for src in sources or ():
-        for c, info in src.candidates(baseline):
+    names += [n + '_adj' for n in names]
+    if len(set(names)) != len(names) or set(names) & set(ranked_sources or {}):
+        raise ValueError('candidate source names must be distinct: %s' % names)
+    expanded = [(src, src.candidates_and_expansions(baseline)) for src in sources or ()]
+    for src, (cands, _) in expanded:
+        for c, info in cands:
             e = entry(c)
             if not e.regression_info:
                 if c in e.inits:
@@ -760,6 +843,12 @@ def candidate_shortlist(baseline, explicit=(), sources=None, ranked_sources=None
                 e.inits.insert(0, c)
             e.source_ranks.setdefault(src.name, info['regression_rank'])
             e.regression_info[src.name] = info
+    for src, (_, expansions) in expanded:  # after every list, so an edge already listed keeps its own start
+        for c, node_rank in expansions:
+            e = entry(c)
+            e.source_ranks.setdefault(src.name + '_adj', node_rank)
+            if not e.inits:
+                e.inits.append(c)
     return merged
 
 

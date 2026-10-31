@@ -37,8 +37,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .root_candidates import (candidate_key, format_source_ranks, rank_root_candidates, restore_best_fitted_state,
-                              fresh_marginal_score)
+from .root_candidates import (candidate_key, format_source_ranks, outgroup_candidate_sources, rank_root_candidates,
+                              restore_best_fitted_state, fresh_marginal_score)
 from .seq_utils import normalize_profile, seq2prof
 
 
@@ -245,9 +245,12 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
 
     Candidates: ``explicit``, the first ``attach_k`` placements of
     ``attachment`` (best first, e.g. from :func:`attachment_candidates`; source
-    label 'attach') and the regression sources of :func:`rank_root_candidates`
-    (``regression_k`` and ``candidate_sources``/``covariation``/``tip_slack``
-    in ``rank_kwargs``; default plain top 5 + covariation top 5).
+    label 'attach') and regression sources. Unless ``rank_kwargs`` names them
+    (``candidate_sources``, or the legacy ``covariation``/``tip_slack``), the
+    regression sources are :func:`outgroup_candidate_sources` (covariation top
+    ``regression_k``) when attachment candidates are used, else
+    :func:`rank_root_candidates`' default (plain and covariation top
+    ``regression_k``).
 
     1. Stage 1: :func:`rank_root_candidates` on the ingroup ``baseline`` (or the
        given ``stage1`` result, which must have been run with the same
@@ -275,6 +278,8 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
         raise ValueError('rank_with_root_messages: pass attachment candidates as attachment=')
     attach = list(attachment)[:attach_k] if attach_k else []
     rank_kwargs['ranked_sources'] = {'attach': attach} if attach else None
+    if attach and all(rank_kwargs.get(a) is None for a in ('candidate_sources', 'covariation', 'tip_slack')):
+        rank_kwargs['candidate_sources'] = outgroup_candidate_sources(regression_k) if regression_k else ()
     if stage1 is None:
         stage1 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, keep_states=True,
                                       **rank_kwargs)

@@ -75,6 +75,7 @@ import copy  # noqa: E402
 
 import numpy as np  # noqa: E402
 
+from treetime.root_candidates import _regression_edges  # noqa: E402
 from treetime.root_candidates import (  # noqa: E402
     EdgeRoot,
     FitConfig,
@@ -85,6 +86,7 @@ from treetime.root_candidates import (  # noqa: E402
     candidate_shortlist,
     classify_trajectory,
     default_candidate_sources,
+    node_incident_edges,
     evaluate_root_candidate,
     fresh_marginal_score,
     plain_candidate_sources,
@@ -412,6 +414,53 @@ def test_shortlist_ranked_sources_and_explicit():
         candidate_shortlist(b, ranked_sources={'plain': extra}, sources=plain_candidate_sources(2))
 
 
+def test_node_candidate_fit_stays_on_the_node(b20):
+    """A NodeRoot fit keeps the node as root with its full degree, so it can never reach the
+    inside of an incident edge (why node_edges exists)."""
+    h = hub(b20)
+    run = evaluate_root_candidate(b20, b20.node(h), FIT2)
+    assert run.root['root_degree'] == len(b20.adj[h])
+    assert sorted(run.root['root_children']) == sorted(b20.adj[h])
+
+
+@pytest.mark.parametrize('fx', ['poly20', 'mixed60'])
+def test_node_edges_expands_node_candidates(fx):
+    b = make_baseline(fx)
+    for ne in (1, 2, None):
+        src = RegressionSource('cov', 5, covariation=True, tip_slack=3.0, slope=None, node_edges=ne)
+        cands, exp = src.candidates_and_expansions(b)
+        nodes = [(c, i['regression_rank']) for c, i in cands if isinstance(c, NodeRoot)]
+        assert nodes, 'fixture should have a node among the top 5'
+        for c, rank in nodes:
+            v = b.node_of[c.split]
+            mine = [e for e, r in exp if r == rank]
+            nz = [w for w, length in b.adj[v].items() if length > 0]
+            assert len(mine) == (len(nz) if ne is None else min(ne, len(nz)))
+            for e in mine:  # an incident, non-zero-length edge, started at its midpoint
+                a = b.node_of[e.split]
+                assert isinstance(e, EdgeRoot) and e.fraction == 0.5
+                assert v in (a, b.toward_ref[a]) and b.adj[a][b.toward_ref[a]] > 0
+        m = candidate_shortlist(b, sources=(src,))
+        listed = {candidate_key(c) for c, _ in cands}
+        assert len(m) == len(listed | {candidate_key(e) for e, _ in exp})
+        for key, e in m.items():
+            assert len(e.inits) == 1
+            if key in listed:
+                assert e.source_ranks['cov'] and e.inits[0] == dict((candidate_key(c), c) for c, _ in cands)[key]
+            else:
+                assert set(e.source_ranks) == {'cov_adj'}
+    # the best-ranked incident edge comes first: n=1 is a prefix of n=2
+    src = lambda ne: RegressionSource('plain', 5, node_edges=ne)  # noqa: E731
+    one, two = src(1).candidates_and_expansions(b)[1], src(2).candidates_and_expansions(b)[1]
+    for c, i in src(0).candidates(b):
+        if isinstance(c, NodeRoot):
+            assert node_incident_edges(b, c, _regression_edges(b), 1) == node_incident_edges(b, c, _regression_edges(b), 2)[:1]
+    assert {candidate_key(e) for e, _ in one} <= {candidate_key(e) for e, _ in two}
+    capped = RegressionSource('plain', 5, node_edges=None, node_edges_max_rank=2).candidates_and_expansions(b)[1]
+    full = src(None).candidates_and_expansions(b)[1]
+    assert capped == [(e, r) for e, r in full if r <= 2]
+
+
 # Per-candidate clock rate ------------------------------------------------------------
 def test_rate_fit_bounds_and_retained_state(b20, top):
     r = evaluate_root_candidate(b20, top, FitConfig(1, rate_rounds=4))
@@ -480,7 +529,8 @@ def test_example_data():
     dates = parse_dates(os.path.join(d, 'h3n2_na_20.metadata.csv'))
     b = UnrootedBaseline(os.path.join(d, 'h3n2_na_20.nwk'), os.path.join(d, 'h3n2_na_20.fasta'), dates)
     assert b.clock_rate > 0
-    res = rank_root_candidates(b, regression_k=3, fit=FIT1, sensitivity_window=None, keep_states=False, rate_rounds=0)
+    res = rank_root_candidates(b, candidate_sources=plain_candidate_sources(3), fit=FIT1, sensitivity_window=None,
+                               keep_states=False, rate_rounds=0)
     assert len(res.results) == 3 and all(np.isfinite(r.score) for r in res.results)
 
 

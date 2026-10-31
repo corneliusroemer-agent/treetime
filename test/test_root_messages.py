@@ -338,3 +338,9 @@ def test_attachment_candidates_and_attach_k(b20, fitted):
         assert len(res.rows) == len(keys)
         assert {candidate_key(r.candidate) for r in res.stage2b.results} == keys
         assert all(row['source_ranks'] for row in res.rows)
+    # default regression part with attachment candidates: covariation top regression_k only
+    res = rank_with_root_messages(b, msg, attachment=cands, regression_k=2, **{k: v for k, v in kw.items()
+                                                                               if k != 'candidate_sources'})
+    labels = {n for r in res.stage1.results for n in r.source_ranks}
+    assert labels == {'cov', 'attach'} and [s['name'] for s in res.stage1.config['candidate_sources']] == ['cov']
+    assert res.stage2b.config['candidate_sources'] == res.stage1.config['candidate_sources']
