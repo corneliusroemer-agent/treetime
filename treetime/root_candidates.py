@@ -383,6 +383,7 @@ class FitRun:
     runtime: float = 0.0
     error: Optional[str] = None
     warnings: list = field(default_factory=list)
+    state_root: dict = field(default_factory=dict)  # root_summary at the best score
     state: object = None  # deep copy of the TreeTime at the best score
 
 
@@ -726,11 +727,9 @@ class RootCandidateEvaluator:
         if score > run.best_score:
             run.best_score = score
             run.best_index = len(run.scores) - 1
+            run.state_root = root_summary(tt)
             if self.keep_states:
                 run.state = _snapshot(tt)
-                run.state_root = root_summary(tt)
-            else:
-                run.state_root = root_summary(tt)
 
     def evaluate(self, candidate, source='explicit', regression=None):
         res = CandidateResult(candidate=candidate, source=source)
@@ -811,7 +810,6 @@ class RootCandidateEvaluator:
 
     def exhaustive(self, close_delta=None):
         """Evaluate every distinct root placement on the baseline tree."""
-        reg = {r['candidate_key']: r for r in reversed(self.regression_ranking())}
         ranks = {}
         for c, rank, chisq, split in self.regression_candidates(k=10 ** 9):
             ranks[candidate_key(c)] = (rank, chisq, split)
