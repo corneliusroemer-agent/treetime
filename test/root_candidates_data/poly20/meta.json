@@ -1,0 +1,19 @@
+{
+ "seed": 2001,
+ "clock_rate": 0.0005,
+ "L": 400,
+ "gtr": "JC69 (GTR.standard('JC69', alphabet='nuc_nogap'))",
+ "iqtree_cmd": "iqtree --pathogen-force -s aln.fasta -m JC --prefix <tmpdir>/x -redo -nt 1",
+ "collapse_threshold": 0.00125,
+ "n_internal_collapsed": 12,
+ "true_root_split": [
+  "L02",
+  "L03",
+  "L11",
+  "L12",
+  "L15",
+  "L17",
+  "L20"
+ ],
+ "true_root_date": 1998.8185
+}
