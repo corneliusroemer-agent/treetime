@@ -42,6 +42,16 @@ from .root_candidates import (candidate_key, format_source_ranks, outgroup_candi
 from .seq_utils import normalize_profile, seq2prof
 
 
+@dataclass(frozen=True)
+class PatternMessages:
+    """Messages in compressed form: position i carries ``table[pattern[i]]``;
+    ``pattern[i] = -1`` is neutral. Used for messages that depend only on a
+    per-position pattern (e.g. the outgroup column), so they are computed and
+    validated once per pattern."""
+    pattern: np.ndarray
+    table: np.ndarray
+
+
 def normalise_root_messages(messages, full_length, n_states):
     """Validate messages and group identical ones.
 
@@ -49,6 +59,8 @@ def normalise_root_messages(messages, full_length, n_states):
     max-normalised message per key, row 0 = ones) and ``log_scale`` (log of each
     message's maximum, 0 for key 0).
     """
+    if isinstance(messages, PatternMessages):
+        return _normalise_pattern_messages(messages, full_length, n_states)
     if isinstance(messages, dict):
         items = [(int(p), np.asarray(v, dtype=float)) for p, v in messages.items()]
     else:
@@ -75,6 +87,35 @@ def normalise_root_messages(messages, full_length, n_states):
             scales.append(float(np.log(mx)))
         keys[p] = index[k]
     return keys, np.array(rows), np.array(scales)
+
+
+def _normalise_pattern_messages(messages, full_length, n_states):
+    pat = np.asarray(messages.pattern, dtype=int)
+    tab = np.asarray(messages.table, dtype=float)
+    if pat.shape != (full_length,):
+        raise ValueError('root-state messages: expected %d pattern indices, got %s' % (full_length, pat.shape))
+    if tab.ndim != 2 or tab.shape[1] != n_states:
+        raise ValueError('root-state messages: table needs %d columns (gtr alphabet), got %s' % (n_states, tab.shape))
+    if pat.size and (pat.min() < -1 or pat.max() >= len(tab)):
+        raise ValueError('root-state messages: pattern index outside the table')
+    used = np.zeros(len(tab), dtype=bool)
+    used[pat[pat >= 0]] = True
+    rows, scales, index = [np.ones(n_states)], [0.0], {}
+    row_key = np.zeros(len(tab) + 1, dtype=int)  # last entry: pattern -1 (neutral)
+    for j in np.nonzero(used)[0]:
+        v = tab[j]
+        if not np.all(np.isfinite(v)) or np.any(v < 0) or not v.max() > 0:
+            raise ValueError('root-state messages: table row %d must be finite, non-negative and not all zero' % j)
+        if np.all(v == 1.0):
+            continue
+        k = v.tobytes()
+        if k not in index:
+            index[k] = len(rows)
+            mx = v.max()
+            rows.append(v / mx)
+            scales.append(float(np.log(mx)))
+        row_key[j] = index[k]
+    return row_key[pat], np.array(rows), np.array(scales)
 
 
 def outgroup_leaf_messages(gtr, seq, d, positions=None):

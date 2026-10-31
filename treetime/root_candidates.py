@@ -1212,12 +1212,7 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
             for x in r.runs:
                 if x is not b:
                     x.state = None
-    if results:
-        top = results[0]
-        for r in results:
-            r.delta_logL = r.score - top.score if np.isfinite(r.score) else None
-            r.resolved_from_best = True if r is top else bool(
-                np.isfinite(r.score) and -r.delta_logL > max(min_margin, top.uncertainty + r.uncertainty))
+    _mark_resolved(results, min_margin)
     config = {
         'branch_length_mode': 'marginal', 'Tc': None, 'resolve_polytomies': False, 'prune_short': False,
         'infer_gtr': False, 'time_marginal': False, 'clock_rate': baseline.clock_rate,
@@ -1230,6 +1225,24 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         'rate_clamp': fit.rate_clamp, 'warm_starts': len(warm_starts),
     }
     return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config)
+
+
+def _mark_resolved(results, min_margin):
+    """delta_logL and resolved_from_best of results sorted best first."""
+    if results:
+        top = results[0]
+        for r in results:
+            r.delta_logL = r.score - top.score if np.isfinite(r.score) else None
+            r.resolved_from_best = True if r is top else bool(
+                np.isfinite(r.score) and -r.delta_logL > max(min_margin, top.uncertainty + r.uncertainty))
+
+
+def finalise_ranking(results, min_margin=1.0, config=None, clock_rate=None):
+    """RootSearchResult from already fitted CandidateResults (sorted, deltas and
+    verdicts as in :func:`rank_root_candidates`)."""
+    results = sorted(results, key=lambda r: -r.score)
+    _mark_resolved(results, min_margin)
+    return RootSearchResult(results=results, clock_rate=clock_rate, min_margin=min_margin, config=dict(config or {}))
 
 
 # --------------------------------------------------------------------------
