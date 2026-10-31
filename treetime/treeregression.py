@@ -329,24 +329,11 @@ class TreeRegression(object):
             dictionary with the node, the fraction `x` at which the branch
             is to be split, and the regression parameters
         """
-        self._calculate_averages()
         best_root = {'chisq': np.inf}
-        for n in self.tree.find_clades():
-            if n == self.tree.root:
-                continue
-
-            tv = self.tip_value(n)
-            bv = self.branch_value(n)
-            var = self.branch_variance(n)
-            x, chisq = self._optimal_root_along_branch(n, tv, bv, var, slope=slope)
-            if chisq < best_root['chisq']:
-                tmpQ = self.propagate_averages(n, tv, bv * x, var * x) + self.propagate_averages(
-                    n, tv, bv * (1 - x), var * (1 - x), outgroup=True
-                )
-                reg = base_regression(tmpQ, slope=slope)
-                if reg['slope'] >= 0 or (force_positive == False):
-                    best_root = {'node': n, 'split': x}
-                    best_root.update(reg)
+        for p in self.all_root_placements(slope=slope):
+            if p['x_chisq'] < best_root['chisq']:
+                if p['slope'] >= 0 or (force_positive == False):
+                    best_root = {k: v for k, v in p.items() if k != 'x_chisq'}
 
         if 'node' not in best_root:
             print(f'TreeRegression.find_best_root: No valid root found! force_positive={force_positive}')
@@ -381,6 +368,59 @@ class TreeRegression(object):
             best_root['cov'] = np.linalg.inv(estimator_hessian)
 
         return best_root
+
+    def all_root_placements(self, slope=None):
+        """
+        optimal root position along every branch of the tree, with the
+        regression evaluated at that position.
+
+        Returns
+        -------
+         list of dict
+            one entry per branch (in `find_clades` order, root excluded, branches
+            without a valid optimum omitted) with the node below the branch, the
+            fraction `split` (0 at the node, 1 at its parent), `x_chisq` from the
+            line search, and the regression parameters at that position
+        """
+        self._calculate_averages()
+        placements = []
+        for n in self.tree.find_clades():
+            if n == self.tree.root:
+                continue
+
+            tv = self.tip_value(n)
+            bv = self.branch_value(n)
+            var = self.branch_variance(n)
+            x, chisq = self._optimal_root_along_branch(n, tv, bv, var, slope=slope)
+            if not np.isfinite(chisq):
+                continue
+            tmpQ = self.propagate_averages(n, tv, bv * x, var * x) + self.propagate_averages(
+                n, tv, bv * (1 - x), var * (1 - x), outgroup=True
+            )
+            p = {'node': n, 'split': x, 'x_chisq': chisq}
+            p.update(base_regression(tmpQ, slope=slope))
+            placements.append(p)
+        return placements
+
+    def rank_roots(self, force_positive=True, slope=None, k=None):
+        """
+        root placements of all branches ordered by regression chi-squared
+        (best first), the ranking `find_best_root` takes the winner of.
+
+        Parameters
+        ----------
+         force_positive : bool
+            drop placements with a negative rate estimate
+         slope : float, optional
+            fixed rate
+         k : int, optional
+            return only the best k placements
+        """
+        placements = [
+            p for p in self.all_root_placements(slope=slope) if p['slope'] >= 0 or (force_positive == False)
+        ]
+        placements.sort(key=lambda p: p['x_chisq'])
+        return placements if k is None else placements[:k]
 
     def _optimal_root_along_branch(self, n, tv, bv, var, slope=None):
         from scipy.optimize import minimize_scalar
