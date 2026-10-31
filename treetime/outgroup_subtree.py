@@ -583,3 +583,120 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
               'attach_k': attach_k, 'regression_k': regression_k, 'warm_start': warm_start,
               'outgroup_newick': outgroup.newick(), 'n_outgroup_patterns': outgroup.n_patterns}
     return Stage3Result(stage1, s3, rows, extra=extra_rows, scan=scan, config=config)
+
+
+# --------------------------------------------------------------------------
+# outgroup topology from a joint (ingroup + outgroup) tree
+# --------------------------------------------------------------------------
+def outgroup_tree_from_joint(tree, outgroup_names, attach_name='ATTACH'):
+    """Outgroup subtree induced by an unrooted joint tree of ingroup and outgroup
+    leaves, for ``OutgroupSubtree(tree=...)``.
+
+    The attachment is the ingroup end of the edge that best separates the
+    ingroup from the outgroups (fewest leaves on the wrong side; a monophyletic
+    ingroup has none). A leaf ``attach_name`` is added there with length 0, every
+    ingroup leaf is pruned, and degree-2 nodes are merged, so the stem starts at
+    the full length of the separating edge and the outgroup edges at their joint-
+    tree lengths. Outgroups nested inside the ingroup stay where the induced
+    subtree puts them. The rooting of ``tree`` is irrelevant.
+
+    Returns a newick string (rooted at the attachment's neighbour; the attachment
+    leaf makes the rooting irrelevant to :class:`OutgroupSubtree`)."""
+    tree = _read_tree(tree)
+    ogs = set(outgroup_names)
+    adj, label = {}, {}
+    ids = {}
+
+    def nid(c):
+        if id(c) not in ids:
+            ids[id(c)] = len(ids)
+            adj[ids[id(c)]] = {}
+            label[ids[id(c)]] = c.name if c.is_terminal() else None
+        return ids[id(c)]
+    for c in tree.find_clades(order='preorder'):
+        for ch in c.clades:
+            a, b = nid(c), nid(ch)
+            adj[a][b] = adj[b][a] = float(ch.branch_length or 0.0)
+    nid(tree.root)
+    leaves = {k: label[k] for k in adj if label[k] is not None and len(adj[k]) <= 1}
+    missing = ogs - set(leaves.values())
+    if missing:
+        raise ValueError('outgroup_tree_from_joint: outgroups missing from the tree: %s' % sorted(missing))
+    n_in = sum(1 for v in leaves.values() if v not in ogs)
+    if n_in == 0:
+        raise ValueError('outgroup_tree_from_joint: the tree has no ingroup leaves')
+
+    # leaf counts below each directed edge (k -> its side away from p)
+    memo = {}
+
+    def below(k, p):
+        if (k, p) not in memo:
+            if k in leaves and p is not None:
+                memo[(k, p)] = (0, 1) if leaves[k] in ogs else (1, 0)
+            else:
+                i = o = 0
+                for w in adj[k]:
+                    if w != p:
+                        a, b = below(w, k)
+                        i, o = i + a, o + b
+                memo[(k, p)] = (i, o)
+        return memo[(k, p)]
+    import sys
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 10 * len(adj) + 1000))
+    best = None
+    for u in adj:
+        for x in adj[u]:
+            i_x, o_x = below(x, u)            # the side of x
+            i_u, o_u = n_in - i_x, len(ogs) - o_x  # the side of u (the ingroup side)
+            cost = o_u + i_x                  # outgroups on the ingroup side + ingroup leaves on the outgroup side
+            if o_x == 0:
+                continue
+            key = (cost, -i_u, adj[u][x], u, x)
+            if best is None or key < best:
+                best = key
+    _, _, _, u, x = best
+    a = max(adj) + 1
+    adj[a], label[a] = {u: 0.0}, attach_name
+    adj[u][a] = 0.0
+    keep = ogs | {attach_name}
+    # prune ingroup leaves and dangling internal nodes, then merge degree-2 nodes
+    changed = True
+    while changed:
+        changed = False
+        for k in list(adj):
+            if len(adj[k]) <= 1 and label[k] not in keep:
+                for w in adj[k]:
+                    del adj[w][k]
+                del adj[k]
+                changed = True
+    for k in [k for k in adj if len(adj[k]) == 2 and label[k] not in keep]:
+        (p, lp), (q, lq) = adj[k].items()
+        del adj[p][k], adj[q][k], adj[k]
+        adj[p][q] = adj[q][p] = lp + lq
+    (top,) = adj[a]
+
+    def nw(k, p):
+        kids = [w for w in sorted(adj[k], key=lambda w: str(label[w])) if w != p]
+        s = label[k] if not kids else '(' + ','.join(nw(w, k) for w in kids) + ')'
+        return '%s:%.10g' % (s, adj[k][p])
+    kids = [w for w in adj[top]]
+    return '(' + ','.join(nw(w, top) for w in kids) + ');'
+
+
+def joint_tree_cmaple(sequences, iqtree='iqtree3', model='GTR', seed=1):
+    """Quick joint tree (IQ-TREE's CMAPLE mode, ``--pathogen-force``) on
+    ``sequences`` (name -> aligned sequence, ingroup and outgroups). Returns a
+    Bio.Phylo tree. Needs an IQ-TREE >= 2.3 binary on PATH (``iqtree``)."""
+    import os
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'aln.fasta'), 'w') as fh:
+            for k, s in sequences.items():
+                fh.write('>%s\n%s\n' % (k, s))
+        cmd = [iqtree, '--pathogen-force', '-s', 'aln.fasta', '-m', model, '--prefix', 'j', '-T', '1',
+               '-seed', str(seed), '-redo']
+        p = subprocess.run(cmd, cwd=td, capture_output=True, text=True)
+        if p.returncode != 0:
+            raise RuntimeError('joint_tree_cmaple: %s failed: %s' % (iqtree, p.stdout[-2000:]))
+        return Phylo.read(os.path.join(td, 'j.treefile'), 'newick')

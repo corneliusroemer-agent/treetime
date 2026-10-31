@@ -340,3 +340,43 @@ def test_reroot_invariance_end_to_end():
     for k in out[0]:
         assert abs(out[0][k][0] - out[1][k][0]) < 1e-8
         assert np.allclose(out[0][k][1], out[1][k][1], rtol=1e-8)
+
+
+# --- outgroup tree induced by a joint tree (CMAPLE helper) ---------------------------
+def test_outgroup_tree_from_joint_tree(fx):
+    from treetime.outgroup_subtree import outgroup_tree_from_joint
+    joint = combined_tree(fx)
+    names = ['O1', 'O2', 'O3']
+    nwk = outgroup_tree_from_joint(joint, names)
+    o = OutgroupSubtree(fx['b'].gtr, fx['ogs'], tree=nwk)
+    base = og3(fx)
+    assert o.edge_names == base.edge_names
+    assert np.allclose(o.lengths, LENGTHS3, atol=1e-10)  # stem = separating edge, outgroup edges as in the joint tree
+    # the joint tree's rooting is irrelevant
+    j2 = copy.deepcopy(joint)
+    j2.root_with_outgroup(next(c for c in j2.get_terminals() if c.name not in names))
+    assert np.allclose(OutgroupSubtree(fx['b'].gtr, fx['ogs'], tree=outgroup_tree_from_joint(j2, names)).lengths,
+                       LENGTHS3, atol=1e-10)
+    # an outgroup nested in the ingroup: still a valid subtree on all outgroups
+    j3 = copy.deepcopy(joint)
+    o3 = next(c for c in j3.find_clades() if c.name == 'O3')
+    j3.prune(o3)
+    leaf = next(c for c in j3.get_terminals() if c.name not in names)
+    leaf.split(n=2, branch_length=0.001)
+    leaf.clades[0].name, leaf.clades[1].name, leaf.name = leaf.name, 'O3', None
+    o = OutgroupSubtree(fx['b'].gtr, fx['ogs'], tree=outgroup_tree_from_joint(j3, names))
+    assert sorted(o.leaf_nodes) == names
+
+
+def test_joint_tree_cmaple_roundtrip():
+    import shutil
+    from treetime.outgroup_subtree import joint_tree_cmaple, outgroup_tree_from_joint
+    if shutil.which('iqtree3') is None:
+        pytest.skip('iqtree3 not on PATH')
+    nwk, aln, dates, _ = load('binary20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    ogs = _outgroups(seqs, len(next(iter(seqs.values()))))
+    t = joint_tree_cmaple(dict(seqs, **ogs), iqtree='iqtree3')
+    o = OutgroupSubtree(b.gtr, ogs, tree=outgroup_tree_from_joint(t, list(ogs)))
+    assert sorted(o.leaf_nodes) == sorted(ogs) and np.all(o.lengths > 0)
