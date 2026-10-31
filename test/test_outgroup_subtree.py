@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from test_root_candidates import load  # noqa: E402
 from test_root_messages_felsenstein import independent_P, nonuniform_gtr  # noqa: E402
 
-from treetime.outgroup_subtree import OutgroupSubtree  # noqa: E402
+from treetime.outgroup_subtree import (OutgroupEvaluator, OutgroupSubtree, attachment_scan,  # noqa: E402
+                                       rank_with_outgroup_subtree)
 from treetime.root_candidates import (FitConfig, UnrootedBaseline, evaluate_root_candidate,  # noqa: E402
                                       fresh_marginal_score, rank_root_candidates, candidate_key)
 from treetime.root_messages import outgroup_leaf_messages, rank_with_root_messages  # noqa: E402
@@ -126,6 +127,26 @@ def test_single_leaf_messages_identical_to_stage2(fx):
     o = OutgroupSubtree(fx['b'].gtr, {'O3': fx['ogs']['O3']})
     o.lengths = np.array([0.03])
     assert np.array_equal(o.messages(), outgroup_leaf_messages(fx['b'].gtr, fx['ogs']['O3'], 0.03))
+
+
+def test_single_outgroup_reproduces_stage2b():
+    nwk, aln, dates, _ = load('binary20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    L = len(next(iter(seqs.values())))
+    og = _outgroups(seqs, L)['O3']
+    d = 0.02
+    cands = b.all_candidates()[2:5]
+    fit = FitConfig(iterations=2)
+    s2 = rank_with_root_messages(b, outgroup_leaf_messages(b.gtr, og, d), explicit=cands, regression_k=0, fit=fit)
+    o = OutgroupSubtree(b.gtr, {'O': og})
+    o.lengths = np.array([d])
+    s3 = rank_with_outgroup_subtree(b, o, explicit=cands, regression_k=0, attachment=(), fit=fit,
+                                    fit_lengths=False, stage1=s2.stage1)
+    a = {r.candidate_id: r.score for r in s2.stage2b.results}
+    c = {r.candidate_id: r.score for r in s3.stage3.results}
+    assert a == c  # bit-identical: same messages, same evaluator
+    assert s2.stage2b.best.candidate_id == s3.stage3.best.candidate_id
 
 
 # --- multiple outgroups: full-tree Felsenstein --------------------------------------
@@ -243,6 +264,32 @@ def test_missing_states(fx):
 
 
 # --- lengths: fitted per candidate, outside the clock ---------------------------------
+def test_length_fit_and_clock_untouched(fx):
+    b = fx['b']
+    o = og3(fx)
+    tt = copy.deepcopy(fx['tt'])
+    lengths, val = o.fit_lengths(tt)
+    assert val >= o.combined_score(tt) - 1e-9
+    ing = fresh_marginal_score(copy.deepcopy(fx['tt']))
+    # the ingroup part does not depend on the outgroup lengths
+    for ls in (LENGTHS3, lengths, LENGTHS3 * 3):
+        ta = copy.deepcopy(fx['tt'])
+        ta.set_root_state_messages(o.messages(ls))
+        fresh_marginal_score(ta)
+        assert abs(ta.tree.total_sequence_LH_ingroup - ing) < TOL
+    ev = OutgroupEvaluator(o, outer_iterations=2)
+    c = b.all_candidates()[3]
+    run = ev(b, c, FitConfig(iterations=2))
+    st = run.state
+    assert {x.name for x in st.tree.get_terminals()} == set(fx['seqs'])  # outgroups are not in the dated tree
+    assert run.clock_rate == b.clock_rate and all(r == b.clock_rate for r in run.clock_rates)
+    assert abs(fresh_marginal_score(copy.deepcopy(st)) - run.best_score) < 1e-9  # best state restored
+    assert run.best_score == max(run.scores)
+    # the retained state's messages are those of the reported lengths
+    assert abs(o.combined_score(copy.deepcopy(st), run.extra['outgroup_lengths']) - run.best_score) < 1e-8
+    assert len(run.extra['outer_rounds']) >= 1
+
+
 def test_single_leaf_fit_matches_stage2_estimate():
     from treetime.root_messages import estimate_outgroup_distance
     nwk, aln, dates, _ = load('binary20')
@@ -256,3 +303,40 @@ def test_single_leaf_fit_matches_stage2_estimate():
     assert abs(np.log(d3 / d2)) < 1e-3 and abs(s3 - s2) < 1e-6
 
 
+# --- driver: extra candidates stay out of the selection ---------------------------
+def test_extra_candidates_do_not_change_selection():
+    nwk, aln, dates, _ = load('binary20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    ogs = _outgroups(seqs, len(next(iter(seqs.values()))))
+    fit = FitConfig(iterations=1)
+    kw = dict(regression_k=2, attach_k=1, fit=fit, outer_iterations=1)
+    r0 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), **kw)
+    listed = {candidate_key(r.candidate) for r in r0.stage3.results}
+    off = next(c for c in b.all_candidates() if candidate_key(b.canonical(c)) not in listed)
+    on = r0.stage3.results[-1].candidate
+    r1 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), extra_candidates=[off, on], **kw)
+    assert [(r.candidate_id, r.score) for r in r1.stage3.results] == [(r.candidate_id, r.score) for r in r0.stage3.results]
+    assert len(r1.extra) == 2 and {x['source'] for x in r1.extra} == {'extra', 'extra(listed)'}
+    new = next(x for x in r1.extra if x['source'] == 'extra')
+    assert new['combined_3'] is not None and np.isfinite(new['combined_3'])
+    assert b.candidate_id(b.canonical(off)) not in {r.candidate_id for r in r1.stage3.results}
+
+
+def test_reroot_invariance_end_to_end():
+    """Whole Stage 3 ranking (length fits, dated fits) with the outgroup tree written in two rootings."""
+    nwk, aln, dates, _ = load('binary20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    ogs = _outgroups(seqs, len(next(iter(seqs.values()))))
+    cands = b.all_candidates()[2:4]
+    out = []
+    for f in ('(((O1:0.008,O2:0.015):0.012,O3:0.02):0.01,ATTACH:0.02);',
+              '(O3:0.01,((O1:0.008,O2:0.015):0.012,ATTACH:0.03):0.01);'):
+        o = OutgroupSubtree(b.gtr, ogs, tree=f)
+        r = rank_with_outgroup_subtree(b, o, explicit=cands, regression_k=0, attachment=(), fit=FitConfig(iterations=1),
+                                       outer_iterations=1)
+        out.append({x.candidate_id: (x.score, x.best_run.extra['outgroup_lengths']) for x in r.stage3.results})
+    for k in out[0]:
+        assert abs(out[0][k][0] - out[1][k][0]) < 1e-8
+        assert np.allclose(out[0][k][1], out[1][k][1], rtol=1e-8)

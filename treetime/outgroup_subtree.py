@@ -28,10 +28,12 @@ the length fit uses the same (ingroup pattern, outgroup pattern) groups.
 
 """
 import copy
+import time
 
 import numpy as np
 from Bio import Phylo
 
+from .root_candidates import (FIT_ERRORS, FitRun, classify_trajectory, evaluate_root_candidate)
 from .seq_utils import seq2prof
 
 STEM = 'stem'
@@ -301,3 +303,283 @@ class OutgroupSubtree:
 
     def copy(self):
         return copy.deepcopy(self)
+
+
+# --------------------------------------------------------------------------
+# per-candidate evaluator: alternating outgroup lengths <-> ingroup dated fit
+# --------------------------------------------------------------------------
+class OutgroupEvaluator:
+    """Drop-in replacement for :func:`evaluate_root_candidate` (pass as
+    ``rank_root_candidates(..., evaluator=)``): the outgroup subtree hangs off
+    each candidate's root, with its lengths fitted per candidate.
+
+    1. Fit the outgroup lengths at the starting ingroup tree (the baseline rooted
+       at the candidate, or the warm-start state), starting from
+       ``outgroup.lengths``.
+    2. Set the messages m(t) and run the Stage 2 dated fit
+       (:func:`evaluate_root_candidate`, bounded iterations, best state kept).
+    3. Up to ``outer_iterations`` times: refit the lengths at the best fitted
+       ingroup state; stop if the combined score gains less than ``tol``;
+       otherwise continue the dated fit from that state under the new messages
+       (a warm trajectory whose step 0 is the state at the new lengths).
+
+    The returned :class:`FitRun` concatenates the trajectories; its best state
+    (and score) is the best over all steps of all rounds, with the outgroup
+    lengths it was scored at in ``run.extra['outgroup_lengths']``. With
+    ``fit_lengths=False`` the lengths stay at ``outgroup.lengths`` (fixed
+    messages: Stage 2b).
+    """
+
+    def __init__(self, outgroup, outer_iterations=2, tol=1e-2, fit_lengths=True):
+        self.outgroup = outgroup
+        self.outer_iterations, self.tol, self.fit = int(outer_iterations), float(tol), bool(fit_lengths)
+
+    def __call__(self, baseline, cand, fit=None, keep_state=True, catch_errors=False, clock_rate=None,
+                 initial_state=None):
+        og = self.outgroup
+        t0 = time.time()
+        cand = baseline.canonical(cand)
+        runs, rounds = [], []
+        try:
+            if initial_state is not None:
+                start = copy.deepcopy(initial_state)
+                start.set_root_state_messages(None)
+            else:
+                start = baseline.make_treeanc(baseline.rooted_phylo(cand), messages=False)
+            if self.fit:
+                lengths, pre = og.fit_lengths(start)
+            else:
+                lengths, pre = og.lengths.copy(), og.combined_score(start)
+            del start
+            b = baseline.with_root_state_messages(og.messages(lengths))
+            run = evaluate_root_candidate(b, cand, fit, keep_state=True, catch_errors=False, clock_rate=clock_rate,
+                                          initial_state=initial_state)
+            runs.append(run)
+            rounds.append({'round': 0, 'lengths': lengths.tolist(), 'pre_fit_score': pre, 'best_score': run.best_score})
+            best_run, best_len = run, lengths
+            for k in range(self.outer_iterations if self.fit else 0):
+                st = best_run.state
+                new_len, val = og.fit_lengths(st, x0=best_len)
+                if val - best_run.best_score < self.tol:
+                    rounds.append({'round': k + 1, 'lengths': new_len.tolist(), 'pre_fit_score': val,
+                                   'best_score': None, 'stopped': 'gain %.3g < tol' % (val - best_run.best_score)})
+                    break
+                b = baseline.with_root_state_messages(og.messages(new_len))
+                run = evaluate_root_candidate(b, cand, fit, keep_state=True, catch_errors=False,
+                                              clock_rate=best_run.clock_rate, initial_state=st)
+                runs.append(run)
+                rounds.append({'round': k + 1, 'lengths': new_len.tolist(), 'pre_fit_score': val,
+                               'best_score': run.best_score})
+                if run.best_score > best_run.best_score:
+                    best_run, best_len = run, new_len
+            out = _merge_runs(runs, best_run, keep_state)
+            out.extra = {'outgroup_lengths': best_len.tolist(), 'outgroup_edges': list(og.edge_names),
+                         'outer_rounds': rounds, 'outer_rounds_performed': len(runs) - 1,
+                         'outgroup_newick': og.newick(best_len)}
+            out.initial_fraction = None if initial_state is not None else getattr(cand, 'fraction', None)
+        except FIT_ERRORS as exc:
+            if not catch_errors:
+                raise
+            out = FitRun(candidate=cand, candidate_id=baseline.candidate_id(cand),
+                         initial_fraction=None if initial_state is not None else getattr(cand, 'fraction', None),
+                         initial_mode='warm' if initial_state is not None else (fit.initial_mode if fit else 'marginal'))
+            out.error = '%s: %s' % (type(exc).__name__, exc)
+            out.best_score = -np.inf
+        out.runtime = time.time() - t0
+        return out
+
+
+def _merge_runs(runs, best_run, keep_state):
+    first = runs[0]
+    out = FitRun(candidate=first.candidate, candidate_id=first.candidate_id, initial_fraction=first.initial_fraction,
+                 initial_mode=first.initial_mode, rate_fitted=first.rate_fitted)
+    offset = 0
+    for r in runs:
+        for name in ('scores', 'cached_LH', 'positional_LH', 'clock_rates', 'ndiff', 'root_state_changes'):
+            getattr(out, name).extend(getattr(r, name))
+        out.iterations_performed += r.iterations_performed
+        out.rate_rounds_performed += r.rate_rounds_performed
+        if out.treetime_stop_iteration is None and r.treetime_stop_iteration is not None:
+            out.treetime_stop_iteration = r.treetime_stop_iteration
+        out.warnings.extend(w for w in r.warnings if w not in out.warnings)
+        if r is best_run:
+            out.best_index = offset + r.best_index
+        offset += len(r.scores)
+    out.best_score, out.clock_rate, out.root = best_run.best_score, best_run.clock_rate, best_run.root
+    out.fitted_newick = best_run.fitted_newick
+    out.state = best_run.state if keep_state else None
+    out.tail_fluctuation = runs[-1].tail_fluctuation
+    out.trajectory_class = classify_trajectory(out.scores)
+    return out
+
+
+# --------------------------------------------------------------------------
+# attachment scan and the Stage 1 / Stage 3 driver
+# --------------------------------------------------------------------------
+def attachment_scan(baseline, outgroup):
+    """Every placement of the unrooted ``baseline`` rooted at the baseline
+    lengths, with the outgroup subtree attached at that root and its lengths
+    fitted by ML there. The outgroup's default lengths are first initialised at
+    the baseline's reference rooting (several stem starts), and finally reset to
+    the lengths fitted at the best placement.
+
+    Returns a list of dicts ``{candidate, score, lengths}``, best score first.
+    Costs one TreeAnc and one length fit per placement."""
+    ta = baseline.make_treeanc(baseline.rooted_phylo(None), messages=False)
+    outgroup.initialise(ta)
+    out = []
+    for i, c in enumerate(baseline.all_candidates()):
+        ta = baseline.make_treeanc(baseline.rooted_phylo(c), messages=False)
+        lengths, score = outgroup.fit_lengths(ta)
+        out.append((-score, i, {'candidate': c, 'score': score, 'lengths': lengths}))
+    out.sort(key=lambda r: r[:2])
+    out = [r[2] for r in out]
+    outgroup.lengths = out[0]['lengths'].copy()
+    outgroup.lengths0 = outgroup.lengths.copy()
+    return out
+
+
+class Stage3Result:
+    """Stage 1 and Stage 3 on one candidate set, plus separately scored extra
+    candidates (e.g. an oracle true root) that never enter the selection."""
+
+    def __init__(self, stage1, stage3, rows, extra=None, scan=None, config=None):
+        self.stage1, self.stage3, self.rows = stage1, stage3, rows
+        self.extra = extra or []  # rows of the extra candidates (same columns)
+        self.scan, self.config = scan, config or {}
+
+    def summary(self):
+        return {'stage1_best': self.stage1.best.candidate_id, 'stage1_margin': self.stage1.margin,
+                'stage3_best': self.stage3.best.candidate_id, 'stage3_margin': self.stage3.margin,
+                'stage3_resolved': self.stage3.best_is_resolved,
+                'n_candidates': len(self.rows), 'n_extra': len(self.extra)}
+
+    def to_tsv(self, path):
+        rows = self.rows + self.extra
+        cols = list(rows[0].keys()) if rows else []
+        with open(path, 'w') as fh:
+            fh.write('\t'.join(cols) + '\n')
+            for r in rows:
+                fh.write('\t'.join('' if r[c] is None else (repr(r[c]) if isinstance(r[c], float) else str(r[c]))
+                                   for c in cols) + '\n')
+
+
+def _warm_from(stage1):
+    from .root_candidates import candidate_key
+    warm = {}
+    for r in stage1.results:
+        b = r.best_run
+        if b is not None and b.error is None and b.state is not None:
+            warm[candidate_key(r.candidate)] = (b.state, b.clock_rate)
+    return warm
+
+
+def _rows(stage1, stage3, outgroup, is_extra=False):
+    from .root_candidates import candidate_key, format_source_ranks, fresh_marginal_score
+    by3 = {candidate_key(r.candidate): r for r in stage3.results}
+    rows = []
+    for r1 in stage1.results:
+        r3 = by3.get(candidate_key(r1.candidate))
+        row = {'candidate_id': r1.candidate_id, 'source': 'extra' if is_extra else r1.source,
+               'source_ranks': format_source_ranks(r1.source_ranks), 'regression_rank': r1.regression_rank,
+               'ingroup_1': r1.score, 'combined_3': None, 'ingroup_3': None, 'outgroup_3': None,
+               'posthoc_3': None, 'outgroup_lengths': None, 'stem': None, 'outer_rounds': None, 'run_3': None,
+               'root_date_1': r1.best_run.root.get('root_date') if r1.best_run else None, 'root_date_3': None,
+               'runtime_1': sum(x.runtime for x in r1.runs), 'runtime_3': None}
+        if r1.best_run is not None and r1.best_run.state is not None:
+            # post hoc: Stage 1 state with the outgroup lengths fitted at it (no refit of the ingroup)
+            row['posthoc_3'] = outgroup.fit_lengths(r1.best_run.state)[1]
+        if r3 is not None and np.isfinite(r3.score):
+            b = r3.best_run
+            row.update(combined_3=r3.score, outgroup_lengths=b.extra.get('outgroup_lengths'),
+                       stem=b.extra.get('outgroup_lengths', [None])[0], outer_rounds=b.extra.get('outer_rounds_performed'),
+                       run_3=b.initial_mode, root_date_3=b.root.get('root_date'),
+                       runtime_3=sum(x.runtime for x in r3.runs))
+            if b.state is not None:
+                st = copy.deepcopy(b.state)
+                fresh_marginal_score(st)
+                row.update(ingroup_3=float(st.tree.total_sequence_LH_ingroup),
+                           outgroup_3=float(st.tree.total_root_message_LH))
+        rows.append(row)
+    return rows
+
+
+def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, attachment='scan',
+                               attach_k=3, extra_candidates=(), stage1=None, warm_start=True, outer_iterations=2,
+                               tol=1e-2, fit_lengths=True, **rank_kwargs):
+    """Stage 1 and Stage 3 (outgroup subtree, lengths fitted per candidate) on
+    one candidate set.
+
+    Candidates as in :func:`~treetime.root_messages.rank_with_root_messages`:
+    ``explicit``, the best ``attach_k`` placements of ``attachment``
+    (``'scan'``: :func:`attachment_scan` of this outgroup subtree; or a list of
+    placements, best first; label 'attach') and the regression sources
+    (covariation top ``regression_k`` when attachment candidates are used,
+    unless ``rank_kwargs`` names sources). Stage 1 (or the given ``stage1``,
+    which must have been run on the same candidates with ``keep_states=True``)
+    and Stage 3 see the same candidate list.
+
+    Stage 3 ranks with :class:`OutgroupEvaluator` (
+    ``outer_iterations``, ``tol``, ``fit_lengths``) through the unchanged
+    :func:`rank_root_candidates`; with ``warm_start`` each candidate also gets a
+    trajectory from its Stage 1 best state, so its Stage 3 score is at least the
+    post hoc score of that state (outgroup lengths fitted at it).
+
+    ``extra_candidates`` (e.g. the true root in a benchmark) are fitted with the
+    same Stage 1 and Stage 3 procedure but outside the ranking: they appear in
+    ``Stage3Result.extra``, never in ``stage3.results``, and cannot change the
+    selected root. An extra candidate already on the shortlist is reported with
+    its shortlist fits.
+    """
+    from .root_candidates import (candidate_key, outgroup_candidate_sources, rank_root_candidates)
+    keep = rank_kwargs.pop('keep_states', True)
+    if 'ranked_sources' in rank_kwargs:
+        raise ValueError('rank_with_outgroup_subtree: pass attachment candidates as attachment=')
+    scan = None
+    if isinstance(attachment, str):
+        if attachment != 'scan':
+            raise ValueError("attachment must be 'scan' or a list of placements")
+        scan = attachment_scan(baseline, outgroup) if attach_k else None
+        attachment = [s['candidate'] for s in scan] if scan else []
+    attach = list(attachment)[:attach_k] if attach_k else []
+    rank_kwargs['ranked_sources'] = {'attach': attach} if attach else None
+    if attach and all(rank_kwargs.get(a) is None for a in ('candidate_sources', 'covariation', 'tip_slack')):
+        rank_kwargs['candidate_sources'] = outgroup_candidate_sources(regression_k) if regression_k else ()
+    if stage1 is None:
+        stage1 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, keep_states=True,
+                                      **rank_kwargs)
+    elif any(r.best_run is not None and r.best_run.error is None and r.best_run.state is None for r in stage1.results):
+        raise ValueError('rank_with_outgroup_subtree: the given stage1 result kept no states')
+    ev = OutgroupEvaluator(outgroup, outer_iterations=outer_iterations, tol=tol, fit_lengths=fit_lengths)
+    s3 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, keep_states=True,
+                              warm_starts=_warm_from(stage1) if warm_start else None, evaluator=ev, **rank_kwargs)
+    k1 = {candidate_key(r.candidate) for r in stage1.results}
+    k3 = {candidate_key(r.candidate) for r in s3.results}
+    if k1 != k3:
+        raise ValueError('rank_with_outgroup_subtree: Stage 1 and Stage 3 candidate sets differ '
+                         '(%d only in Stage 1, %d only in Stage 3)' % (len(k1 - k3), len(k3 - k1)))
+    rows = _rows(stage1, s3, outgroup)
+    # extra candidates: same fits, outside the ranking
+    extra_rows = []
+    listed = {candidate_key(baseline.canonical(c)) for c in extra_candidates} & k1
+    new = [c for c in extra_candidates if candidate_key(baseline.canonical(c)) not in k1]
+    for r1, row in zip(stage1.results, rows):  # rows follow stage1.results
+        if candidate_key(r1.candidate) in listed:
+            extra_rows.append(dict(row, source='extra(listed)'))
+    if new:
+        xkw = {k: v for k, v in rank_kwargs.items() if k not in ('ranked_sources', 'candidate_sources',
+                                                                 'covariation', 'tip_slack')}
+        x1 = rank_root_candidates(baseline, explicit=new, regression_k=0, keep_states=True, candidate_sources=(),
+                                  **xkw)
+        x3 = rank_root_candidates(baseline, explicit=new, regression_k=0, keep_states=True, candidate_sources=(),
+                                  warm_starts=_warm_from(x1) if warm_start else None, evaluator=ev, **xkw)
+        extra_rows += _rows(x1, x3, outgroup, is_extra=True)
+    if not keep:
+        for res in (stage1, s3):
+            for r in res.results:
+                for x in r.runs:
+                    x.state = None
+    config = {'outer_iterations': outer_iterations, 'tol': tol, 'fit_lengths': fit_lengths,
+              'attach_k': attach_k, 'regression_k': regression_k, 'warm_start': warm_start,
+              'outgroup_newick': outgroup.newick(), 'n_outgroup_patterns': outgroup.n_patterns}
+    return Stage3Result(stage1, s3, rows, extra=extra_rows, scan=scan, config=config)

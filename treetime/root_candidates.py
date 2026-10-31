@@ -465,6 +465,7 @@ class FitRun:
     error: Optional[str] = None
     warnings: list = field(default_factory=list)
     state: object = None  # deep copy of the TreeTime at the best step
+    extra: dict = field(default_factory=dict)  # evaluator-specific diagnostics (e.g. Stage 3 outgroup lengths)
 
 
 def _root_summary(baseline, cand, tt):
@@ -1084,7 +1085,7 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
                          sensitivity_fractions=(0.1, 0.5, 0.9), min_margin=1.0, covariation=None,
                          tip_slack=None, keep_states=True, catch_errors=False, rate_rounds=0, rate_fit_window=5.0,
                          rate_fit_min=3, rate_fit_max=15, rate_fit_extra=(), warm_starts=None,
-                         candidate_sources=None, ranked_sources=None):
+                         candidate_sources=None, ranked_sources=None, evaluator=None):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
@@ -1155,6 +1156,11 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
 
     ``keep_states=False`` keeps no TreeTime copies; otherwise only the best run
     of each candidate keeps its copy.
+
+    ``evaluator``: replaces :func:`evaluate_root_candidate` (same signature and
+    return type) for every fit; Stage 3 passes an
+    :class:`~treetime.outgroup_subtree.OutgroupEvaluator`, whose messages depend
+    on the candidate. Selection, rate fits and margins are unchanged.
     """
     fit = fit or FitConfig()
     sources = resolve_candidate_sources(regression_k, candidate_sources, covariation, tip_slack)
@@ -1169,8 +1175,8 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         cfg = FitConfig(fit.iterations, mode, rate_rounds=rounds, rate_span=fit.rate_span, rate_clamp=fit.rate_clamp,
                         rate_xatol=fit.rate_xatol)
         state, mu = warm if warm is not None else (None, None)
-        return evaluate_root_candidate(baseline, c, cfg, keep_state=keep_states, catch_errors=catch_errors,
-                                       clock_rate=mu, initial_state=state)
+        return (evaluator or evaluate_root_candidate)(baseline, c, cfg, keep_state=keep_states,
+                                                      catch_errors=catch_errors, clock_rate=mu, initial_state=state)
 
     results = []
     for key, d in merged.items():
