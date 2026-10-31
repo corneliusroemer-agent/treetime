@@ -262,3 +262,19 @@ def test_classify_trajectory():
     assert classify_trajectory([1.0, 2.0, 1.0, 2.0]) == 'cycling'
     assert classify_trajectory([-10.0, -18.0, -10.2, -17.0]) == 'oscillating'
     assert classify_trajectory([1.0, 2.0, 3.0]) == 'drifting'
+
+
+def test_duplicate_internal_labels_are_renamed():
+    """Tree-builder labels (e.g. support values) on internal nodes need not be unique."""
+    d = os.path.join(DATA, QUICK)
+    tree = Phylo.read(os.path.join(d, 'fitted.nwk'), 'newick')
+    for c in tree.get_nonterminals():
+        c.name = '100'
+    n_internal = len(tree.get_nonterminals())
+    b = UnrootedBaseline(tree, os.path.join(d, 'aln.fasta'), load_dates(os.path.join(d, 'dates.tsv')),
+                         gtr='JC69', optimize_baseline=False, clock_rate=1e-3)
+    assert all(c.name == '100' for c in tree.get_nonterminals())  # input not mutated
+    ref = load_sim(QUICK, optimize_baseline=False, clock_rate=1e-3)
+    assert b.splits == ref.splits
+    assert len([v for v in b.adj if not b.is_leaf(v)]) == len([v for v in ref.adj if not ref.is_leaf(v)])
+    assert len([v for v in b.adj if not b.is_leaf(v)]) <= n_internal
