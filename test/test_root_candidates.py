@@ -20,6 +20,7 @@ from treetime.root_candidates import (
     evaluate_root_candidate,
     fresh_marginal_score,
     rank_root_candidates,
+    classify_trajectory,
     restore_best_fitted_state,
     score_newick,
 )
@@ -141,8 +142,8 @@ def test_fresh_score_matches_saved_tree_and_state_is_reproducible(quick):
     # 3: the restored tree, and a new TreeAnc built from the saved newick, score the same
     assert fresh_marginal_score(r['tt']) == pytest.approx(r['fresh_marginal_LH'], abs=1e-9)
     assert score_newick(quick, r['fitted_newick']) == pytest.approx(r['fresh_marginal_LH'], abs=1e-6)
-    # cached and fresh are separate quantities
-    assert 'cached_marginal_LH' in r and 'positional_LH' in r
+    # cached and fresh are separate quantities; the cached value is stale (predates the time tree)
+    assert any(abs(h['cached_marginal_LH'] - h['fresh_marginal_LH']) > 1e-6 for h in r['history'])
     # 4: the snapshot installed into a different, freshly built object reproduces score and dates
     other = quick.make_treetime(quick.rooted_phylo(quick.canonical(cand)))
     restore_best_fitted_state(other, r['best_state'])
@@ -230,15 +231,31 @@ def test_exhaustive_search_reproducible(quick):
 
 # Acceptance 9 ---------------------------------------------------------------
 def test_close_candidates_get_optimiser_diagnostics(quick):
-    s = quick.split_of[internal_nodes(quick)[1]]
-    cands = [EdgeRoot(s, 0.45), EdgeRoot(s, 0.55)]
-    res, summ = rank_root_candidates(quick, explicit=cands, regression_k=0, fit=FIT1, sensitivity_window=1e9, n_jobs=6)
+    hub = internal_nodes(quick)[1]
+    cands = [quick.node(hub), quick.edge(hub, 0.5)]
+    res, summ = rank_root_candidates(quick, explicit=cands, regression_k=0, fit=FIT1, sensitivity_window=1e9,
+                                     n_jobs=4)
     for r in res:
-        assert len(r['initialisations']) > 1
+        assert r['n_initialisations'] > 1
         assert r['init_spread'] is not None and r['uncertainty'] >= r['init_spread']
     top, other = res
     assert other['resolved_from_best'] == (-other['delta_LH'] > top['uncertainty'] + other['uncertainty'])
     assert summ['best_is_resolved'] == other['resolved_from_best']
-    # candidates far outside the window are not re-fitted
+    # candidates outside the window are not re-fitted
     res, _ = rank_root_candidates(quick, explicit=cands, regression_k=0, fit=FIT1, sensitivity_window=-1.0)
-    assert all(len(r['initialisations']) == 1 for r in res)
+    assert all(r['n_initialisations'] == 1 for r in res)
+
+
+def test_fractions_on_one_edge_are_one_candidate(quick):
+    s = quick.split_of[internal_nodes(quick)[1]]
+    res, _ = rank_root_candidates(quick, explicit=[EdgeRoot(s, 0.3), EdgeRoot(s, 0.7)], regression_k=0, fit=FIT1,
+                                  run_sensitivity=False, n_jobs=2)
+    assert len(res) == 1 and res[0]['n_initialisations'] == 2
+    assert res[0]['fresh_marginal_LH'] == max(i['fresh_marginal_LH'] for i in res[0]['initialisations'])
+
+
+def test_classify_trajectory():
+    assert classify_trajectory([1.0, 2.0, 2.0]) == 'fixed_point'
+    assert classify_trajectory([1.0, 2.0, 1.0, 2.0]) == 'cycling'
+    assert classify_trajectory([-10.0, -18.0, -10.2, -17.0]) == 'oscillating'
+    assert classify_trajectory([1.0, 2.0, 3.0]) == 'drifting'

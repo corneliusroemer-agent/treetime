@@ -232,7 +232,7 @@ class UnrootedBaseline:
         a = self.node_of[cand.split]
         if isinstance(cand, NodeRoot):
             return 'node:%s' % a
-        return 'edge:%s-%s@%.4f' % (a, self.toward_ref[a], cand.fraction)
+        return 'edge:%s-%s' % (a, self.toward_ref[a])
 
     def all_candidates(self, fraction=0.5):
         """Exhaustive set: every internal node plus the midpoint of every edge."""
@@ -399,14 +399,20 @@ def _effective_fraction(baseline, cand, entry):
 
 
 def classify_trajectory(scores, tol=1e-6):
-    """'fixed_point' if the last two scores agree within tol, 'cycling' if the
-    last score revisits an earlier (non-adjacent) one, else 'drifting'."""
+    """'fixed_point' if the last two scores agree within tol; 'cycling' if the
+    last score revisits an earlier (non-adjacent) one within tol; 'oscillating'
+    if the last three steps alternate in sign and the score returns closer to
+    where it was two steps before than to the previous step; else 'drifting'."""
     if len(scores) < 2:
         return 'single'
     if abs(scores[-1] - scores[-2]) <= tol:
         return 'fixed_point'
     if any(abs(scores[-1] - s) <= tol for s in scores[:-2]):
         return 'cycling'
+    if len(scores) >= 4:
+        d = np.diff(scores[-4:])
+        if d[0] * d[1] < 0 and d[1] * d[2] < 0 and abs(scores[-1] - scores[-3]) < 0.5 * abs(d[2]):
+            return 'oscillating'
     return 'drifting'
 
 
@@ -454,12 +460,13 @@ def evaluate_root_candidate(baseline, cand, fit=None, keep_tt=False, catch_error
 
         def record(it, ndiff):
             nonlocal best
+            cached = float(getattr(tt.tree, 'sequence_marginal_LH', np.nan))  # read before refreshing
             score = fresh_marginal_score(tt)
             entry = {
                 'iteration': it,
                 'ndiff': ndiff,
                 'fresh_marginal_LH': score,
-                'cached_marginal_LH': float(getattr(tt.tree, 'sequence_marginal_LH', np.nan)),
+                'cached_marginal_LH': cached,
                 'positional_LH': float(tt.tree.positional_LH),
             }
             entry.update(_root_summary(tt))
@@ -537,9 +544,11 @@ def regression_candidates(baseline, k=5, force_positive=True):
 # --------------------------------------------------------------------------
 # orchestration
 # --------------------------------------------------------------------------
-def _alternatives(cand):
+def _alternatives(cand, tried):
+    """Alternative initialisations for the sensitivity check."""
     if isinstance(cand, EdgeRoot):
-        return [(EdgeRoot(cand.split, f), 'marginal') for f in (0.1, 0.5, 0.9) if abs(f - cand.fraction) > 0.05]
+        return [(EdgeRoot(cand.split, f), 'marginal') for f in (0.1, 0.5, 0.9)
+                if all(abs(f - t) > 0.05 for t in tried)]
     return [(cand, 'joint')]
 
 
@@ -569,10 +578,20 @@ def _map_eval(baseline, jobs, n_jobs, catch_errors):
         _FORK_JOBS = None
 
 
+def candidate_key(cand):
+    """Identity of a candidate: the node, or the edge (the fraction is only an
+    initialisation)."""
+    return (cand.kind, cand.split)
+
+
 def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=3.0,
                          run_sensitivity=True, n_jobs=1, catch_errors=False):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
+
+    Candidates are identified by node or edge; several initial fractions on the
+    same edge (explicit and/or regression) are one candidate with several
+    initialisations, the regression's fraction being the primary one.
 
     Candidates within ``sensitivity_window`` log units of the best are re-fitted
     from alternative initialisations (other fractions for edge roots, a joint-mode
@@ -585,24 +604,40 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     """
     fit = fit or FitConfig()
     merged = {}
-    for c in explicit:
+
+    def add(c, source, info=None):
         c = baseline.canonical(c)
-        merged.setdefault(c, {'sources': []})['sources'].append('explicit')
+        d = merged.setdefault(candidate_key(c), {'sources': [], 'inits': []})
+        if source not in d['sources']:
+            d['sources'].append(source)
+        if info:
+            d.update(info)
+            d['inits'].insert(0, c)  # regression fraction is the primary initialisation
+        elif c not in d['inits']:
+            d['inits'].append(c)
+
+    for c in explicit:
+        add(c, 'explicit')
     if regression_k:
         for c, info in regression_candidates(baseline, k=regression_k):
-            d = merged.setdefault(c, {'sources': []})
-            d['sources'].append('regression')
-            d.update(info)
-    results = []
-    evaluated = _map_eval(baseline, [(c, fit) for c in merged], n_jobs, catch_errors)
-    for (c, info), r in zip(merged.items(), evaluated):
-        r.update({'source': '+'.join(info['sources']),
-                  'regression_rank': info.get('regression_rank'),
-                  'regression_chisq': info.get('regression_chisq'),
-                  'initialisations': [{'fraction': r['initial_fraction'], 'mode': fit.initial_mode,
-                                       'fresh_marginal_LH': r['fresh_marginal_LH']}]})
-        r['_cand'] = c
-        results.append(r)
+            add(c, 'regression', info)
+    for d in merged.values():
+        d['inits'] = list(dict.fromkeys(d['inits']))
+
+    jobs = [(key, c, fit.initial_mode) for key, d in merged.items() for c in d['inits']]
+    evaluated = _map_eval(baseline, [(c, FitConfig(fit.iterations, m, fit.cycle_tol)) for _, c, m in jobs],
+                          n_jobs, catch_errors)
+    results = {}
+    for (key, c, mode), r in zip(jobs, evaluated):
+        if key not in results:
+            info = merged[key]
+            r.update({'source': '+'.join(info['sources']),
+                      'regression_rank': info.get('regression_rank'),
+                      'regression_chisq': info.get('regression_chisq'),
+                      'initialisations': [], '_cand': c})
+            results[key] = r
+        _fold(results[key], r, mode)
+    results = list(results.values())
 
     def finalize():
         best = max(r['fresh_marginal_LH'] for r in results)
@@ -610,32 +645,29 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
             r['delta_LH'] = r['fresh_marginal_LH'] - best
         return best
 
-    best = finalize()
+    finalize()
     if run_sensitivity:
-        todo = [(r, alt, mode) for r in results if not (r['failed'] or r['delta_LH'] < -sensitivity_window)
-                for alt, mode in _alternatives(r['_cand'])]
+        todo = []
+        for r in results:
+            if r['failed'] or r['delta_LH'] < -sensitivity_window:
+                continue
+            tried = [i['fraction'] for i in r['initialisations'] if i['fraction'] is not None]
+            todo += [(r, alt, mode) for alt, mode in _alternatives(r['_cand'], tried)]
         alts = _map_eval(baseline, [(alt, FitConfig(fit.iterations, mode, fit.cycle_tol)) for _, alt, mode in todo],
                          n_jobs, catch_errors)
         for (r, alt, mode), a in zip(todo, alts):
-            r['initialisations'].append({'fraction': a['initial_fraction'], 'mode': mode,
-                                         'fresh_marginal_LH': a['fresh_marginal_LH']})
-            if a['fresh_marginal_LH'] > r['fresh_marginal_LH']:
-                keep = {k: r[k] for k in ('source', 'regression_rank', 'regression_chisq', 'initialisations',
-                                          '_cand', 'initial_fraction', 'candidate_id')}
-                keep['best_initialisation'] = {'fraction': a['initial_fraction'], 'mode': mode}
-                keep['warnings'] = r['warnings'] + a['warnings'] + ['best score from alternative initialisation']
-                a.pop('warnings')
-                r.update(a)
-                r.update(keep)
-        best = finalize()
+            _fold(r, a, mode)
+        finalize()
     for r in results:
         sc = [i['fresh_marginal_LH'] for i in r['initialisations'] if np.isfinite(i['fresh_marginal_LH'])]
+        r['n_initialisations'] = len(r['initialisations'])
         r['init_spread'] = float(max(sc) - min(sc)) if len(sc) > 1 else None
         r['uncertainty'] = max(r.get('tail_fluctuation') or 0.0, r['init_spread'] or 0.0)
     results.sort(key=lambda r: -r['fresh_marginal_LH'])
     top = results[0]
     for r in results:
         r['resolved_from_best'] = (r is top) or (-r['delta_LH'] > top['uncertainty'] + r['uncertainty'])
+        r['same_fitted_tree_as_best'] = (r is not top) and r.get('fitted_newick') == top.get('fitted_newick')
         r.pop('_cand', None)
     summary = {
         'best': top['candidate_id'],
@@ -643,14 +675,32 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         'unresolved_with_best': [r['candidate_id'] for r in results[1:] if not r['resolved_from_best']],
         'clock_rate': baseline.clock_rate,
         'regression_best': next((r['candidate_id'] for r in results if r.get('regression_rank') == 1), None),
+        'n_failed': sum(r['failed'] for r in results),
     }
     return results, summary
 
 
+def _fold(r, a, mode):
+    """Record evaluation ``a`` as an initialisation of candidate result ``r``; if it
+    scores higher, ``r`` takes over its fitted state (identity fields are kept)."""
+    r['initialisations'].append({'fraction': a['initial_fraction'], 'mode': mode,
+                                 'fresh_marginal_LH': a['fresh_marginal_LH'], 'failed': a['failed']})
+    if a is r:
+        r['best_initialisation'] = {'fraction': a['initial_fraction'], 'mode': mode}
+        return
+    if a['fresh_marginal_LH'] > r['fresh_marginal_LH']:
+        keep = {k: r[k] for k in ('source', 'regression_rank', 'regression_chisq', 'initialisations', '_cand',
+                                  'initial_fraction', 'candidate_id')}
+        keep['warnings'] = r['warnings'] + [w for w in a['warnings'] if w not in r['warnings']]
+        r.update(a)
+        r.update(keep)
+        r['best_initialisation'] = {'fraction': a['initial_fraction'], 'mode': mode}
+
+
 TABLE_COLS = ['candidate_id', 'source', 'regression_rank', 'fresh_marginal_LH', 'delta_LH', 'positional_LH',
               'root_date', 'root_degree', 'initial_fraction', 'effective_fraction', 'iterations_performed',
-              'best_iteration', 'trajectory_class', 'tail_fluctuation', 'init_spread', 'uncertainty',
-              'resolved_from_best', 'runtime_s']
+              'best_iteration', 'trajectory_class', 'tail_fluctuation', 'n_initialisations', 'init_spread',
+              'uncertainty', 'resolved_from_best', 'same_fitted_tree_as_best', 'runtime_s']
 
 
 def results_table(results, cols=TABLE_COLS):
