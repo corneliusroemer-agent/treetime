@@ -127,7 +127,6 @@ def test_single_leaf_messages_identical_to_stage2(fx):
     o = OutgroupSubtree(fx['b'].gtr, {'O3': fx['ogs']['O3']})
     o.lengths = np.array([0.03])
     assert np.array_equal(o.messages(), outgroup_leaf_messages(fx['b'].gtr, fx['ogs']['O3'], 0.03))
-    assert np.array_equal(o.messages(eps=0.0), o.messages())
 
 
 def test_single_outgroup_reproduces_stage2b():
@@ -262,24 +261,6 @@ def test_missing_states(fx):
         oo = OutgroupSubtree(fx['b'].gtr, ogs, tree='((O1,O2),O3);')
         vals[ch] = oo.messages(LENGTHS3)[j]
     assert np.allclose(m[j], vals['A'] + vals['G'], rtol=1e-12)
-
-
-def test_eps_mixture(fx):
-    o = og3(fx)
-    m0 = o.pattern_messages()
-    assert np.array_equal(o.pattern_messages(eps=0.0), m0)
-    eps = 0.05
-    me = o.pattern_messages(eps=eps)
-    c = m0 @ np.asarray(fx['b'].gtr.Pi)
-    ok = ~o.neutral_patterns
-    assert np.allclose(me[ok], (1 - eps) * m0[ok] + eps * c[ok, None], rtol=1e-13)
-    assert np.all(me[o.neutral_patterns] == 1.0)
-    # the mixture caps the per-column ratio between root states
-    r0 = (m0.max(1) / m0.min(1))[ok]
-    re = (me.max(1) / me.min(1))[ok]
-    assert np.all(re <= r0 + 1e-12) and np.all(re <= 1 + (1 - eps) / eps * m0.max(1)[ok] / c[ok] + 1e-9)
-    # a mixture of likelihoods of the same data: pi-weighted, it leaves the outgroup marginal unchanged
-    assert np.allclose(me @ np.asarray(fx['b'].gtr.Pi), c, rtol=1e-12)
 
 
 # --- lengths: fitted per candidate, outside the clock ---------------------------------
