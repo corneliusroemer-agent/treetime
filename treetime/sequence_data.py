@@ -119,6 +119,7 @@ class SequenceData(object):
         self._full_length = None
         self.full_length = sequence_length
         self._compressed_length = None
+        self._pattern_keys = None  # optional per-position refinement of the compression
         self.word_length = word_length
         self.fill_overhangs = fill_overhangs
         self.ambiguous = ambiguous
@@ -400,6 +401,10 @@ class SequenceData(object):
             # FIXME: this could be done more efficiently
             if len(unique_letters) > 1:
                 str_pattern += '_%d' % pi
+            # columns with different refinement keys (e.g. different external
+            # root-state messages) are kept in separate patterns
+            if self._pattern_keys is not None and self._pattern_keys[pi]:
+                str_pattern += '|%d' % self._pattern_keys[pi]
 
             # if the pattern is not yet seen,
             if str_pattern not in alignment_patterns:
@@ -433,11 +438,16 @@ class SequenceData(object):
                 str_pattern = c * len(self.sequence_names)
                 pos_list = list(range(pi, pi + n))
                 if n:
-                    if str_pattern in alignment_patterns:
-                        alignment_patterns[str_pattern][1].extend(pos_list)
-                    else:
-                        alignment_patterns[str_pattern] = (len(compressed_aln_transpose), pos_list)
-                        compressed_aln_transpose.append(np.array(list(str_pattern)))
+                    groups = {}
+                    for pos in pos_list:
+                        key = self._pattern_keys[pos] if self._pattern_keys is not None else 0
+                        groups.setdefault(str_pattern + ('|%d' % key if key else ''), []).append(pos)
+                    for str_key, pos_group in groups.items():
+                        if str_key in alignment_patterns:
+                            alignment_patterns[str_key][1].extend(pos_group)
+                        else:
+                            alignment_patterns[str_key] = (len(compressed_aln_transpose), pos_group)
+                            compressed_aln_transpose.append(np.array(list(str_pattern)))
                     pi += n
                     columns_left -= n
 
@@ -462,6 +472,31 @@ class SequenceData(object):
         self.logger('SequenceData: constructed compressed alignment...', 1)
         self._compressed_length = len(self._multiplicity)
         return ttconf.SUCCESS
+
+    def refine_patterns(self, keys):
+        """Split compressed patterns so that columns with different keys never
+        share a pattern, then rebuild the compressed alignment.
+
+        Parameters
+        ----------
+        keys : array of int, length full_length, or None
+            Refinement key per position of the full alignment; key 0 leaves a
+            column's pattern unchanged, so all-zero keys (or None) reproduce the
+            ordinary compression exactly. Multiplicities and the position maps
+            are rebuilt consistently; the full alignment is never expanded.
+        """
+        if keys is not None:
+            keys = np.asarray(keys, dtype=int)
+            if keys.shape != (self.full_length,):
+                raise ValueError('SequenceData.refine_patterns: need one key per position (%d)' % self.full_length)
+            if not keys.any():
+                keys = None
+            elif not self.compress:
+                keys = None  # every column is its own pattern already
+            elif self.is_sparse:
+                raise NotImplementedError('SequenceData.refine_patterns: not supported for sparse (vcf) alignments')
+        self._pattern_keys = keys
+        self.make_compressed_alignment()
 
     def full_to_sparse_sequence(self, sequence):
         """turn a sequence into a dictionary of differences from a reference sequence

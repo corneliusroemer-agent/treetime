@@ -158,6 +158,7 @@ class TreeAnc(object):
         self.ignore_gaps = ignore_gaps
         self.reconstructed_tip_sequences = False
         self.sequence_reconstruction = None
+        self.root_state_message = None  # external root-state likelihoods, see set_root_state_messages
         self.ignore_missing_alns = ignore_missing_alns
         self.keep_node_order = keep_node_order
         self.rng = np.random.default_rng(seed=rng_seed)
@@ -811,21 +812,100 @@ class TreeAnc(object):
         self.sequence_reconstruction = 'marginal'
         return N_diff
 
+    def set_root_state_messages(self, messages):
+        """Attach external root-state likelihoods m_i(a) = P(D_ext,i | R_i = a).
+
+        The message multiplies the root prior once, in
+        :meth:`total_LH_and_root_sequence`, so the root posterior, the internal
+        marginal profiles, the branch profiles and everything fitted from them
+        include it, and ``tree.total_sequence_LH`` becomes
+        sum_i log sum_a pi_a l_i(a) m_i(a).
+
+        Parameters
+        ----------
+        messages : dict, array or None
+            ``{position: vector}`` (0-based positions of the full alignment) or
+            an array of shape (full_length, n_states); vectors are in the order
+            of ``gtr.alphabet``. Positions not given are neutral (m = 1). Values
+            are likelihoods, not posteriors: their scale is kept and enters the
+            score. ``None`` removes the messages.
+
+        Compressed patterns are refined so that every pattern carries a single
+        message (positions with neutral messages keep their ordinary patterns;
+        all-neutral messages leave the compression unchanged). Any previous
+        reconstruction is discarded: call this before inference.
+        """
+        from .root_messages import normalise_root_messages
+
+        if messages is None:
+            self.root_state_message = None
+            keys = None
+        else:
+            keys, table, log_scale = normalise_root_messages(messages, self.data.full_length, len(self.gtr.alphabet))
+            self.root_state_message = {'keys': keys, 'table': table, 'log_scale': log_scale}
+        self.data.refine_patterns(keys)
+        self._reset_reconstruction()
+
+    def _reset_reconstruction(self):
+        """Drop sequences, profiles and messages that depend on the compressed
+        alignment (after its patterns changed)."""
+        for node in self.tree.find_clades():
+            for attr in ('marginal_subtree_LH', 'marginal_subtree_LH_prefactor', 'marginal_log_Lx',
+                         'marginal_outgroup_LH', 'marginal_profile', 'profile_pair', 'branch_state',
+                         'joint_Lx', 'joint_Cx', 'seq_idx'):
+                if hasattr(node, attr):
+                    delattr(node, attr)
+            # reconstructed sequences are indexed by the old patterns (tips only when reconstructed)
+            if hasattr(node, '_cseq') and (not node.is_terminal() or self.reconstructed_tip_sequences):
+                del node._cseq
+        self.sequence_reconstruction = False
+
+    def compressed_root_message(self):
+        """(normalised message, log scale) per compressed pattern, or None.
+
+        Each row is the supplied message divided by its maximum; the log of that
+        maximum is returned separately so the score keeps the supplied scale.
+        """
+        msg = self.root_state_message
+        if msg is None:
+            return None
+        first = np.array([self.data.compressed_to_full_sequence_map[p][0] for p in range(self.data.compressed_length)])
+        ckeys = msg['keys'][first]
+        for p in np.nonzero(ckeys)[0]:  # each pattern must carry one message
+            if np.any(msg['keys'][self.data.compressed_to_full_sequence_map[p]] != ckeys[p]):
+                raise ValueError('TreeAnc: compressed pattern %d mixes root-state messages' % p)
+        return msg['table'][ckeys], msg['log_scale'][ckeys]
+
     def total_LH_and_root_sequence(self, sample_from_profile=False, assign_sequence=False):
         self.logger('Computing root node sequence and total tree likelihood...', 3)
         # Msg to the root from the distant part (equ frequencies)
         if len(self.gtr.Pi.shape) == 1:
-            self.tree.root.marginal_outgroup_LH = np.repeat([self.gtr.Pi], self.data.compressed_length, axis=0)
+            prior = np.repeat([self.gtr.Pi], self.data.compressed_length, axis=0)
         else:
-            self.tree.root.marginal_outgroup_LH = np.copy(self.gtr.Pi.T)
+            prior = np.copy(self.gtr.Pi.T)
 
+        cmsg = self.compressed_root_message()
+        if cmsg is None:
+            self.tree.root.marginal_outgroup_LH = prior
+        else:
+            # external root-state likelihoods: combined with the prior exactly once
+            self.tree.root.marginal_outgroup_LH = prior * cmsg[0]
         self.tree.root.marginal_profile, pre = normalize_profile(
             self.tree.root.marginal_outgroup_LH * self.tree.root.marginal_subtree_LH
         )
         marginal_LH_prefactor = self.tree.root.marginal_subtree_LH_prefactor + pre
 
-        self.tree.sequence_LH = marginal_LH_prefactor
+        if cmsg is None:
+            self.tree.sequence_LH = marginal_LH_prefactor
+            self.tree.sequence_LH_ingroup = marginal_LH_prefactor
+        else:
+            self.tree.sequence_LH = marginal_LH_prefactor + cmsg[1]
+            self.tree.sequence_LH_ingroup = self.tree.root.marginal_subtree_LH_prefactor + np.log(
+                (prior * self.tree.root.marginal_subtree_LH).sum(axis=1)
+            )
         self.tree.total_sequence_LH = (self.tree.sequence_LH * self.data.multiplicity()).sum()
+        self.tree.total_sequence_LH_ingroup = (self.tree.sequence_LH_ingroup * self.data.multiplicity()).sum()
+        self.tree.total_root_message_LH = self.tree.total_sequence_LH - self.tree.total_sequence_LH_ingroup
         self.tree.sequence_marginal_LH = self.tree.total_sequence_LH
         if assign_sequence:
             seq, prof_vals, idxs = prof2seq(
@@ -1016,6 +1096,10 @@ class TreeAnc(object):
         msg_from_children = np.sum(np.stack([c.joint_Lx for c in self.tree.root], axis=0), axis=0)
         # Pi(i) * Prod_ch Lch(i)
         self.tree.root.joint_Lx = msg_from_children + np.log(self.gtr.Pi).T
+        cmsg = self.compressed_root_message()
+        if cmsg is not None:  # external root-state likelihoods, as in the marginal case
+            with np.errstate(divide='ignore'):
+                self.tree.root.joint_Lx = self.tree.root.joint_Lx + np.log(cmsg[0]) + cmsg[1][:, None]
         normalized_profile = (self.tree.root.joint_Lx.T - self.tree.root.joint_Lx.max(axis=1)).T
 
         # choose sequence characters from this profile.
