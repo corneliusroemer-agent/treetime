@@ -394,6 +394,10 @@ def classify_trajectory(scores, tol=1e-6):
 class FitConfig:
     iterations: int = 4             # fitting iterations after the initial time tree
     initial_mode: str = 'marginal'  # 'joint': alternative first branch-length round
+    rate_rounds: int = 0            # per-candidate rate: max rounds of (rate step, ancestral inference, time tree)
+    rate_span: float = 4.0          # each rate step searches [mu/span, mu*span] around the current rate
+    rate_clamp: float = 10.0        # overall the rate stays within [mu0/clamp, mu0*clamp]
+    rate_xatol: float = 1e-3        # tolerance of the rate step on log(mu); also the early-stop threshold
 
 
 @dataclass
@@ -413,12 +417,16 @@ class FitRun:
     scores: list = field(default_factory=list)
     cached_LH: list = field(default_factory=list)
     positional_LH: list = field(default_factory=list)
+    clock_rates: list = field(default_factory=list)  # clock rate of the time tree at each step
+    rate_fitted: bool = False  # the rate was fitted (fit.rate_rounds > 0)
+    rate_rounds_performed: int = 0
     ndiff: list = field(default_factory=list)  # TreeTime's ndiff per iteration (None at index 0)
     root_state_changes: list = field(default_factory=list)  # root sequence positions changed
     iterations_performed: int = 0
     treetime_stop_iteration: Optional[int] = None  # where run() would have stopped on ndiff == 0
     best_index: Optional[int] = None
     best_score: float = -np.inf
+    clock_rate: Optional[float] = None  # rate of the best-scoring state
     trajectory_class: str = ''
     tail_fluctuation: float = 0.0  # max - min of the second half of the trajectory
     root: dict = field(default_factory=dict)  # root summary at the best step
@@ -445,7 +453,16 @@ def _root_summary(baseline, cand, tt):
     }
 
 
-def evaluate_root_candidate(baseline, cand, fit=None, keep_state=True, catch_errors=False):
+def _rescale_rate(tt, mu):
+    """Set every branch length to mu x (its calendar time span), keeping all node
+    dates: the strict-clock state (same dates, rate mu). Used inside the rate
+    step only; the next time tree rebuilds the clock model at mu."""
+    for n in tt.tree.find_clades(order='preorder'):
+        if n.up is not None:
+            n.branch_length = mu * (n.numdate - n.up.numdate)
+
+
+def evaluate_root_candidate(baseline, cand, fit=None, keep_state=True, catch_errors=False, clock_rate=None):
     """Fit one candidate from a clean baseline; returns a :class:`FitRun`.
 
     The steps mirror ``TreeTime.run(root=None)`` on the pre-rooted tree in the
@@ -464,13 +481,26 @@ def evaluate_root_candidate(baseline, cand, fit=None, keep_state=True, catch_err
     is recorded. This is an initialisation only: the dated fit sets the final
     lengths. Node roots are never altered.
 
+    With ``fit.rate_rounds`` > 0 the clock rate is fitted per candidate, jointly
+    with the dates, by coordinate ascent starting from ``clock_rate`` (default
+    the baseline rate mu0). Each round maximises the fresh likelihood over the
+    rate at fixed node dates (every branch length = rate x time span; bounded
+    Brent on log rate within a factor ``rate_span`` of the current rate and
+    ``rate_clamp`` of mu0), then runs one more (marginal ancestral inference,
+    time tree) at the new rate and records that state; it stops early when the
+    rate moves by less than ``rate_xatol`` in log. States are recorded only after
+    a time tree, so each retained state is a consistent TreeTime fit at its rate
+    (``FitRun.clock_rates``, ``FitRun.clock_rate`` for the best step). A rate
+    within 1% of the clamp is reported as a warning.
+
     Errors propagate unless ``catch_errors`` is set; a failed fit then has
     score -inf and the error in ``error``.
     """
     fit = fit or FitConfig()
     cand = baseline.canonical(cand)
     run = FitRun(candidate=cand, candidate_id=baseline.candidate_id(cand),
-                 initial_fraction=getattr(cand, 'fraction', None), initial_mode=fit.initial_mode)
+                 initial_fraction=getattr(cand, 'fraction', None), initial_mode=fit.initial_mode,
+                 rate_fitted=fit.rate_rounds > 0)
     t0 = time.time()
     try:
         tt = baseline.make_treetime(baseline.rooted_phylo(cand))
@@ -481,21 +511,49 @@ def evaluate_root_candidate(baseline, cand, fit=None, keep_state=True, catch_err
             run.warnings.append('zero-length root edge: initial length set to one mutation')
         tt._set_branch_length_mode('marginal')
         seq_kwargs = _seq_kwargs()
-        tt_kwargs = {'clock_rate': baseline.clock_rate, 'time_marginal': False}
+        mu = float(clock_rate if clock_rate is not None else baseline.clock_rate)
+        if not mu > 0:
+            raise ValueError('clock_rate must be positive')
         tt.optimize_tree(infer_gtr=False, max_iter=1, method_anc='probabilistic', **_seq_kwargs(fit.initial_mode))
         tt.optimize_tree(max_iter=1, method_anc='probabilistic', **seq_kwargs)
-        tt.make_time_tree(**tt_kwargs)
-        _record(baseline, run, tt, None, None, keep_state)
-        for it in range(1, fit.iterations + 1):
+        tt.make_time_tree(clock_rate=mu, time_marginal=False)
+        _record(baseline, run, tt, mu, None, None, keep_state)
+
+        def iterate():
             prev_root = np.array(tt.tree.root._cseq, copy=True)
             ndiff = tt.infer_ancestral_sequences('ml', marginal=True, **seq_kwargs)
             root_changes = int(np.sum(prev_root != tt.tree.root._cseq))
-            tt.make_time_tree(**tt_kwargs)
-            run.iterations_performed = it
+            tt.make_time_tree(clock_rate=mu, time_marginal=False)
+            run.iterations_performed += 1
             if ndiff == 0 and run.treetime_stop_iteration is None:
-                run.treetime_stop_iteration = it
-            _record(baseline, run, tt, int(ndiff), root_changes, keep_state)
-        tail = run.scores[len(run.scores) // 2:]
+                run.treetime_stop_iteration = run.iterations_performed
+            _record(baseline, run, tt, mu, int(ndiff), root_changes, keep_state)
+
+        for _ in range(fit.iterations):
+            iterate()
+        if fit.rate_rounds:
+            from scipy.optimize import minimize_scalar
+
+            def neg(x):
+                _rescale_rate(tt, float(np.exp(x)))
+                return -fresh_marginal_score(tt)
+            glo, ghi = np.log(mu / fit.rate_clamp), np.log(mu * fit.rate_clamp)
+        for _ in range(fit.rate_rounds):
+            x0 = np.log(mu)
+            lo, hi = max(glo, x0 - np.log(fit.rate_span)), min(ghi, x0 + np.log(fit.rate_span))
+            x = float(minimize_scalar(neg, bounds=(lo, hi), method='bounded', options={'xatol': fit.rate_xatol}).x)
+            mu = float(np.exp(x))
+            _rescale_rate(tt, mu)
+            if min(x - glo, ghi - x) < np.log(1.01) and 'rate at bound' not in run.warnings:
+                run.warnings.append('rate at bound')
+            iterate()
+            run.rate_rounds_performed += 1
+            if abs(x - x0) < fit.rate_xatol:
+                break
+        # oscillation measure: second half of the last phase (the rate rounds when the
+        # rate is fitted, whose earlier steps are the climb towards the fitted rate)
+        phase = run.scores[fit.iterations + 1:] if run.rate_rounds_performed >= 2 else run.scores
+        tail = phase[len(phase) // 2:]
         run.tail_fluctuation = float(max(tail) - min(tail))
         run.trajectory_class = classify_trajectory(run.scores)
     except FIT_ERRORS as exc:
@@ -507,16 +565,19 @@ def evaluate_root_candidate(baseline, cand, fit=None, keep_state=True, catch_err
     return run
 
 
-def _record(baseline, run, tt, ndiff, root_changes, keep_state):
+def _record(baseline, run, tt, mu, ndiff, root_changes, keep_state):
+    """Record the state after a time tree (never after a bare rate rescale)."""
     run.cached_LH.append(float(getattr(tt.tree, 'sequence_marginal_LH', np.nan)))  # before the refresh
     run.positional_LH.append(float(tt.tree.positional_LH))
     score = fresh_marginal_score(tt)
     run.scores.append(score)
+    run.clock_rates.append(mu)
     run.ndiff.append(ndiff)
     run.root_state_changes.append(root_changes)
     if score > run.best_score:
         run.best_score = score
         run.best_index = len(run.scores) - 1
+        run.clock_rate = mu
         run.root = _root_summary(baseline, run.candidate, tt)
         run.fitted_newick = fitted_newick(tt)
         if keep_state:
@@ -578,6 +639,7 @@ class CandidateResult:
     runs: list = field(default_factory=list)
     delta_logL: Optional[float] = None
     resolved_from_best: Optional[bool] = None
+    rate_fitted: bool = False
 
     @property
     def best_run(self):
@@ -591,8 +653,10 @@ class CandidateResult:
 
     @property
     def init_spread(self):
-        """max - min of the best scores reached from different initialisations."""
-        sc = [r.best_score for r in self.runs if r.error is None]
+        """max - min of the best scores reached from different initialisations
+        (among runs with the same rate setting as the best run)."""
+        b = self.best_run
+        sc = [r.best_score for r in self.runs if r.error is None and r.rate_fitted == b.rate_fitted]
         return float(max(sc) - min(sc)) if len(sc) > 1 else None
 
     @property
@@ -617,7 +681,8 @@ class CandidateResult:
             'delta_logL': self.delta_logL,
             'positional_LH': b.positional_LH[b.best_index] if ok else None,
             'cached_LH': b.cached_LH[b.best_index] if ok else None,
-            'clock_rate': clock_rate,
+            'clock_rate': b.clock_rate if ok else clock_rate,
+            'rate_fitted': self.rate_fitted,
             'initial_fraction': b.initial_fraction if b else None,
             'initial_mode': b.initial_mode if b else None,
             'fitted_fraction': b.root.get('fitted_fraction') if ok else None,
@@ -642,7 +707,7 @@ class CandidateResult:
 
 
 TSV_COLS = ['candidate_id', 'stable_id', 'kind', 'source', 'regression_rank', 'regression_chisq', 'logL', 'delta_logL',
-            'positional_LH', 'cached_LH', 'clock_rate', 'initial_fraction', 'initial_mode', 'fitted_fraction',
+            'positional_LH', 'cached_LH', 'clock_rate', 'rate_fitted', 'initial_fraction', 'initial_mode', 'fitted_fraction',
             'root_date', 'root_degree', 'root_child_lengths', 'iterations_performed', 'best_iteration',
             'treetime_stop_iteration', 'trajectory_class', 'tail_fluctuation', 'n_initialisations',
             'init_spread', 'uncertainty', 'resolved_from_best', 'runtime', 'error', 'warnings', 'scores']
@@ -768,7 +833,8 @@ def _alternatives(cand, tried_fractions, fractions):
 
 def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=3.0,
                          sensitivity_fractions=(0.1, 0.5, 0.9), min_margin=1.0, covariation=False,
-                         tip_slack=None, keep_states=True, catch_errors=False):
+                         tip_slack=None, keep_states=True, catch_errors=False, rate_rounds=6, rate_fit_window=5.0,
+                         rate_fit_min=3, rate_fit_max=15, rate_fit_extra=()):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
@@ -788,6 +854,19 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     ``min_margin`` (default 1 log unit) is calibrated on simulations, where
     optimiser spread alone left most wrong answers looking resolved; it only
     affects the verdict, never the ranking. ``min_margin=0`` disables it.
+
+    **Clock rate.** Every candidate is first fitted at the baseline's shared rate.
+    With ``rate_rounds`` > 0 (the default), every candidate within
+    ``rate_fit_window`` of the best (at least ``rate_fit_min``, at most
+    ``rate_fit_max``, best first), plus the regression's rank-1 candidate and any
+    ``rate_fit_extra`` candidates, is then re-fitted with the rate fitted per
+    candidate jointly with the dates
+    (:func:`evaluate_root_candidate`, ``FitConfig.rate_rounds``), starting from the
+    shared rate; their score is the maximum over rate and dates. A shared-rate fit
+    is the special case of one fixed rate, so a candidate's score never drops.
+    Candidates not re-fitted keep their shared-rate score, a lower bound
+    (``rate_fitted`` column). Their sensitivity re-fits use the same rate setting.
+    ``rate_rounds=0`` uses the shared rate throughout.
 
     ``keep_states=False`` keeps no TreeTime copies; otherwise only the best run
     of each candidate keeps its copy.
@@ -813,9 +892,10 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
                                              tip_slack=tip_slack):
             add(c, 'regression', info)
 
-    def evaluate(c, mode):
-        return evaluate_root_candidate(baseline, c, FitConfig(fit.iterations, mode), keep_state=keep_states,
-                                       catch_errors=catch_errors)
+    def evaluate(c, mode, rounds=0):
+        cfg = FitConfig(fit.iterations, mode, rate_rounds=rounds, rate_span=fit.rate_span, rate_clamp=fit.rate_clamp,
+                        rate_xatol=fit.rate_xatol)
+        return evaluate_root_candidate(baseline, c, cfg, keep_state=keep_states, catch_errors=catch_errors)
 
     results = []
     for key, d in merged.items():
@@ -828,13 +908,24 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         results.append(res)
 
     results.sort(key=lambda r: -r.score)
+    if rate_rounds and results and np.isfinite(results[0].score):
+        top = results[0].score
+        ok = [r for r in results if np.isfinite(r.score)]
+        chosen = [r for i, r in enumerate(ok) if i < rate_fit_min or top - r.score <= rate_fit_window][:rate_fit_max]
+        extra = {candidate_key(baseline.canonical(c)) for c in rate_fit_extra}
+        chosen += [r for r in ok if r not in chosen and (r.regression_rank == 1 or candidate_key(r.candidate) in extra)]
+        for r in chosen:
+            b = r.best_run  # rate fit from the best shared-rate initialisation
+            r.runs.append(evaluate(b.candidate, b.initial_mode, rate_rounds))
+            r.rate_fitted = True
+        results.sort(key=lambda r: -r.score)
     if sensitivity_window is not None and results and np.isfinite(results[0].score):
         top = results[0].score
         for r in results:
             if np.isfinite(r.score) and top - r.score <= sensitivity_window:
                 tried = [x.initial_fraction for x in r.runs if x.initial_fraction is not None]
                 for alt, mode in _alternatives(r.candidate, tried, sensitivity_fractions):
-                    r.runs.append(evaluate(alt, mode))
+                    r.runs.append(evaluate(alt, mode, rate_rounds if r.rate_fitted else 0))
         results.sort(key=lambda r: -r.score)
 
     if keep_states:
@@ -855,7 +946,9 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         'iterations': fit.iterations, 'initial_mode': fit.initial_mode, 'rng_seed': baseline.rng_seed,
         'regression_k': regression_k, 'covariation': covariation, 'tip_slack': tip_slack,
         'sensitivity_window': sensitivity_window, 'sensitivity_fractions': list(sensitivity_fractions),
-        'min_margin': min_margin,
+        'min_margin': min_margin, 'rate_rounds': rate_rounds, 'rate_fit_window': rate_fit_window,
+        'rate_fit_min': rate_fit_min, 'rate_fit_max': rate_fit_max, 'rate_span': fit.rate_span,
+        'rate_clamp': fit.rate_clamp,
     }
     return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config)
 

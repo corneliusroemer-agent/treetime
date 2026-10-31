@@ -156,7 +156,7 @@ def test_exhaustive_search_reproducible_and_order_independent():
     b = make_baseline('poly20')
     cands = b.all_candidates()
     assert len(cands) == len({candidate_key(c) for c in cands}) == len(b.internal_nodes()) + len(b.splits)
-    kw = dict(regression_k=0, fit=FitConfig(0), sensitivity_window=None, keep_states=False)
+    kw = dict(regression_k=0, fit=FitConfig(0), sensitivity_window=None, keep_states=False, rate_rounds=0)
     fwd = rank_root_candidates(b, explicit=cands, **kw)
     rev = rank_root_candidates(make_baseline('poly20'), explicit=cands[::-1], **kw)
     a = {r.candidate_id: r.score for r in fwd.results}
@@ -222,7 +222,7 @@ def test_node_and_edge_semantics(b20):
     # fractions on one edge are one candidate with several initialisations
     s = b.split_of[b.internal_nodes()[1]]
     res = rank_root_candidates(b, explicit=[EdgeRoot(s, 0.3), EdgeRoot(s, 0.7)], regression_k=0, fit=FitConfig(0),
-                               sensitivity_window=None)
+                               sensitivity_window=None, rate_rounds=0)
     assert len(res.results) == 1 and len(res.best.runs) == 2
     assert res.best.score == max(x.best_score for x in res.best.runs)
 
@@ -257,7 +257,7 @@ def test_topology_and_high_degree_nodes_preserved(fx):
 def test_known_root_and_close_candidate_diagnostics(b20):
     true = true_split('binary20', b20)
     res = rank_root_candidates(b20, explicit=[EdgeRoot(true, 0.5)], regression_k=4, fit=FIT1,
-                               sensitivity_window=3.0)
+                               sensitivity_window=3.0, rate_rounds=3)
     assert res.best.candidate == EdgeRoot(true, res.best.candidate.fraction)
     close = [r for r in res.results if res.best.score - r.score <= 3.0]
     far = [r for r in res.results if res.best.score - r.score > 3.0]
@@ -265,7 +265,10 @@ def test_known_root_and_close_candidate_diagnostics(b20):
     for r in close:
         assert len(r.runs) > 1 and r.init_spread is not None and r.uncertainty >= r.init_spread
         assert any(x.initial_mode == 'joint' for x in r.runs)
-    assert all(len(r.runs) == 1 for r in far)
+    assert all(len(r.runs) == 1 for r in far if not r.rate_fitted)
+    # rate-fit set: within rate_fit_window (5) of the best, at least 3, and the regression rank 1
+    assert res.best.rate_fitted and sum(r.rate_fitted for r in res.results) >= 3
+    assert all(r.rate_fitted for r in res.results if r.regression_rank == 1)
     top_ = res.best
     for r in res.results[1:]:
         assert r.resolved_from_best == (-r.delta_logL > max(res.min_margin, top_.uncertainty + r.uncertainty))
@@ -282,7 +285,7 @@ def test_known_root_and_close_candidate_diagnostics(b20):
 def test_min_margin_flags_a_close_pair(b20, top):
     """Two placements whose fits differ by less than min_margin are never called resolved."""
     nbr = b20.node(b20.node_of[top.split]) if not b20.is_leaf(b20.node_of[top.split]) else b20.node(hub(b20))
-    kw = dict(explicit=[top, nbr], regression_k=0, fit=FitConfig(0), sensitivity_window=None)
+    kw = dict(explicit=[top, nbr], regression_k=0, fit=FitConfig(0), sensitivity_window=None, rate_rounds=0)
     res = rank_root_candidates(b20, min_margin=0.0, **kw)
     gap = res.margin
     assert gap > 0
@@ -291,7 +294,7 @@ def test_min_margin_flags_a_close_pair(b20, top):
 
 def test_explicit_and_regression_candidates_are_merged(b20, top):
     res = rank_root_candidates(b20, explicit=[EdgeRoot(top.split, 0.2)], regression_k=1, fit=FitConfig(0),
-                               sensitivity_window=None)
+                               sensitivity_window=None, rate_rounds=0)
     assert len(res.results) == 1 and res.best.source == 'explicit+regression'
     assert res.best.regression_rank == 1 and len(res.best.runs) == 2
     assert res.best.runs[0].initial_fraction == pytest.approx(top.fraction)  # regression fraction first
@@ -302,6 +305,35 @@ def test_covariation_regression_candidates(b20):
     cov = regression_candidates(b20, k=3, covariation=True, tip_slack=3)
     assert len(plain) == len(cov) == 3
     assert [i['regression_rank'] for _, i in cov] == [1, 2, 3]
+
+
+# Per-candidate clock rate ------------------------------------------------------------
+def test_rate_fit_bounds_and_retained_state(b20, top):
+    r = evaluate_root_candidate(b20, top, FitConfig(1, rate_rounds=4))
+    mu0 = b20.clock_rate
+    assert all(mu0 / 10 <= m <= mu0 * 10 and m > 0 for m in r.clock_rates)
+    assert r.clock_rate == r.clock_rates[r.best_index] and r.rate_rounds_performed >= 1
+    assert r.best_score >= max(r.scores[:2])  # never worse than the shared-rate part of the trajectory
+    state = restore_best_fitted_state(r)
+    assert fresh_marginal_score(copy.deepcopy(state)) == pytest.approx(r.best_score, abs=1e-9)
+    assert score_newick(b20, r.fitted_newick) == pytest.approx(r.best_score, abs=1e-6)
+    # the retained time tree is the clock fit at the recorded rate: branch length = rate x time span
+    for n in state.tree.find_clades():
+        if n.up is not None and n.branch_length > 1e-12:
+            assert n.branch_length == pytest.approx(r.clock_rate * (n.numdate - n.up.numdate), rel=1e-6)
+    # re-running reproduces it exactly, and evaluation order does not matter
+    other = evaluate_root_candidate(b20, b20.node(hub(b20)), FitConfig(1, rate_rounds=4), keep_state=False)
+    r2 = evaluate_root_candidate(b20, top, FitConfig(1, rate_rounds=4), keep_state=False)
+    other2 = evaluate_root_candidate(b20, b20.node(hub(b20)), FitConfig(1, rate_rounds=4), keep_state=False)
+    assert r2.scores == r.scores and r2.clock_rates == r.clock_rates and other.scores == other2.scores
+
+
+def test_rate_fit_moves_towards_true_rate(b20, top):
+    """binary20 was simulated at rate 0.0018: started from twice that, the fitted rate moves back."""
+    true_rate = load('binary20')[3]['clock_rate']
+    r = evaluate_root_candidate(b20, top, FitConfig(1, rate_rounds=6), clock_rate=2 * true_rate, keep_state=False)
+    assert abs(np.log(r.clock_rate / true_rate)) < 0.5 * np.log(2)
+    assert r.best_score > r.scores[0]
 
 
 def test_classify_trajectory():
@@ -343,7 +375,7 @@ def test_example_data():
     dates = parse_dates(os.path.join(d, 'h3n2_na_20.metadata.csv'))
     b = UnrootedBaseline(os.path.join(d, 'h3n2_na_20.nwk'), os.path.join(d, 'h3n2_na_20.fasta'), dates)
     assert b.clock_rate > 0
-    res = rank_root_candidates(b, regression_k=3, fit=FIT1, sensitivity_window=None, keep_states=False)
+    res = rank_root_candidates(b, regression_k=3, fit=FIT1, sensitivity_window=None, keep_states=False, rate_rounds=0)
     assert len(res.results) == 3 and all(np.isfinite(r.score) for r in res.results)
 
 
@@ -354,7 +386,7 @@ def test_plots_render(b20, top, tmp_path):
     from treetime.root_candidates import plot_root_candidates, plot_root_to_tip
 
     res = rank_root_candidates(b20, explicit=[b20.node(hub(b20))], regression_k=3, fit=FitConfig(0),
-                               sensitivity_window=None, keep_states=False)
+                               sensitivity_window=None, keep_states=False, rate_rounds=0)
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 5))
     plot_root_candidates(res, b20, true_candidate=EdgeRoot(true_split('binary20', b20)), ax=a1)
     plot_root_to_tip(b20, top, ax=a2)
