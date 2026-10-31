@@ -831,9 +831,9 @@ def _alternatives(cand, tried_fractions, fractions):
     return alts
 
 
-def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=3.0,
+def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=None,
                          sensitivity_fractions=(0.1, 0.5, 0.9), min_margin=1.0, covariation=False,
-                         tip_slack=None, keep_states=True, catch_errors=False, rate_rounds=6, rate_fit_window=5.0,
+                         tip_slack=None, keep_states=True, catch_errors=False, rate_rounds=0, rate_fit_window=5.0,
                          rate_fit_min=3, rate_fit_max=15, rate_fit_extra=()):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
@@ -844,19 +844,28 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     :func:`regression_candidates` (``covariation``/``tip_slack`` choose its
     model); its score is kept for diagnostics only.
 
-    Every candidate within ``sensitivity_window`` log units of the best is
-    re-fitted from alternative initialisations (:func:`_alternatives`). A
-    candidate's score is its best over initialisations, and its optimiser
-    uncertainty ``u`` the larger of the spread across initialisations and the
-    tail fluctuation of its best trajectory. A candidate is *resolved* from the
-    best when ΔlogL > max(min_margin, u_best + u_candidate).
+    A candidate's optimiser uncertainty ``u`` is the tail fluctuation of its best
+    trajectory, or, where alternative initialisations were run, the larger of
+    that and their spread. A candidate is *resolved* from the best when
+    ΔlogL > max(min_margin, u_best + u_candidate). "Resolved" is a statement about
+    the optimiser, not about the true root: under clock misspecification the
+    likelihood can prefer a wrong root by many log units.
+
+    Opt-in extras (off by default; on simulated benchmarks they changed almost
+    no answer and cost several fits per candidate):
+
+    * ``sensitivity_window``: every candidate within this many log units of the
+      best is re-fitted from alternative initialisations (:func:`_alternatives`:
+      other initial fractions and a joint-mode start); its score is its best
+      over initialisations.
+    * ``rate_rounds`` > 0: per-candidate clock rate, below.
 
     ``min_margin`` (default 1 log unit) is calibrated on simulations, where
     optimiser spread alone left most wrong answers looking resolved; it only
     affects the verdict, never the ranking. ``min_margin=0`` disables it.
 
     **Clock rate.** Every candidate is first fitted at the baseline's shared rate.
-    With ``rate_rounds`` > 0 (the default), every candidate within
+    With ``rate_rounds`` > 0, every candidate within
     ``rate_fit_window`` of the best (at least ``rate_fit_min``, at most
     ``rate_fit_max``, best first), plus the regression's rank-1 candidate and any
     ``rate_fit_extra`` candidates, is then re-fitted with the rate fitted per
