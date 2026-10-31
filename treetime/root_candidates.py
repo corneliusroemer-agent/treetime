@@ -119,7 +119,7 @@ class UnrootedBaseline:
             raise ValueError('UnrootedBaseline: clock_rate must be positive')
 
     # -- construction --------------------------------------------------------
-    def _from_phylo(self, tree, keep_names=False):
+    def _from_phylo(self, tree, keep_names=False, allow_edge_root=False):
         adj = {}
         counter = [0]
         names = set(c.name for c in tree.find_clades() if c.name)
@@ -146,7 +146,7 @@ class UnrootedBaseline:
         self.leaves = sorted(c.name for c in tree.get_terminals())
         if len(set(self.leaves)) != len(self.leaves):
             raise ValueError('UnrootedBaseline: duplicate leaf names')
-        if EDGE_ROOT_NAME in adj:
+        if EDGE_ROOT_NAME in adj and not allow_edge_root:
             raise ValueError('UnrootedBaseline: node name %s is reserved' % EDGE_ROOT_NAME)
         # suppress degree-2 nodes (bifurcating root, unary nodes)
         changed = True
@@ -284,7 +284,7 @@ class UnrootedBaseline:
         """(set of non-trivial splits, sorted internal degree list) of ``tree``
         viewed as unrooted, with degree-2 nodes suppressed."""
         other = UnrootedBaseline.__new__(UnrootedBaseline)
-        other._from_phylo(copy.deepcopy(_strip_tree(tree)), keep_names=True)
+        other._from_phylo(_strip_tree(tree), keep_names=True, allow_edge_root=True)
         nontriv = {s for s in other.splits if 1 < len(s) < len(other.all_leaves) - 1}
         degrees = sorted(len(v) for k, v in other.adj.items() if k not in other.leaves)
         return nontriv, degrees
@@ -410,7 +410,7 @@ def classify_trajectory(scores, tol=1e-6):
     return 'drifting'
 
 
-def evaluate_root_candidate(baseline, cand, fit=None, keep_tt=False):
+def evaluate_root_candidate(baseline, cand, fit=None, keep_tt=False, catch_errors=False):
     """Fit one candidate from a clean baseline and return its result dict.
 
     Sequence of updates (mirrors ``TreeTime.run(root=None)`` on a pre-rooted tree
@@ -419,6 +419,9 @@ def evaluate_root_candidate(baseline, cand, fit=None, keep_tt=False):
     ``fit.iterations`` rounds of (marginal ancestral inference, time tree).
     The fresh marginal likelihood is recorded after every time tree; the
     best-scoring complete state is restored at the end.
+
+    Errors propagate unless ``catch_errors`` is set, in which case the
+    candidate is marked failed with score -inf and the error in ``warnings``.
     """
     fit = fit or FitConfig()
     cand = baseline.canonical(cand)
@@ -496,7 +499,9 @@ def evaluate_root_candidate(baseline, cand, fit=None, keep_tt=False):
         if keep_tt:
             res['tt'] = tt
             res['best_state'] = best['state']
-    except Exception as exc:  # one failing candidate must not abort a sweep
+    except Exception as exc:
+        if not catch_errors:
+            raise
         res['failed'] = True
         res['warnings'].append('%s: %s' % (type(exc).__name__, exc))
         res['fresh_marginal_LH'] = -np.inf
@@ -538,8 +543,34 @@ def _alternatives(cand):
     return [(cand, 'joint')]
 
 
+_FORK_JOBS = None  # job list inherited by forked workers (the baseline need not be picklable)
+
+
+def _eval_job(i):
+    baseline, cand, fit, catch_errors = _FORK_JOBS[i]
+    return evaluate_root_candidate(baseline, cand, fit, catch_errors=catch_errors)
+
+
+def _map_eval(baseline, jobs, n_jobs, catch_errors):
+    """Evaluate (candidate, FitConfig) pairs, optionally in forked worker processes.
+    Each evaluation builds its own TreeTime object, so results do not depend on
+    which process or in which order a candidate is evaluated."""
+    global _FORK_JOBS
+    _FORK_JOBS = [(baseline, c, f, catch_errors) for c, f in jobs]
+    try:
+        if n_jobs and n_jobs > 1 and len(_FORK_JOBS) > 1:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(max_workers=min(n_jobs, len(_FORK_JOBS)),
+                                     mp_context=mp.get_context('fork')) as ex:
+                return list(ex.map(_eval_job, range(len(_FORK_JOBS))))
+        return [_eval_job(i) for i in range(len(_FORK_JOBS))]
+    finally:
+        _FORK_JOBS = None
+
+
 def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=3.0,
-                         run_sensitivity=True):
+                         run_sensitivity=True, n_jobs=1, catch_errors=False):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
@@ -563,8 +594,8 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
             d['sources'].append('regression')
             d.update(info)
     results = []
-    for c, info in merged.items():
-        r = evaluate_root_candidate(baseline, c, fit)
+    evaluated = _map_eval(baseline, [(c, fit) for c in merged], n_jobs, catch_errors)
+    for (c, info), r in zip(merged.items(), evaluated):
         r.update({'source': '+'.join(info['sources']),
                   'regression_rank': info.get('regression_rank'),
                   'regression_chisq': info.get('regression_chisq'),
@@ -581,20 +612,21 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
 
     best = finalize()
     if run_sensitivity:
-        for r in results:
-            if r['failed'] or r['delta_LH'] < -sensitivity_window:
-                continue
-            for alt, mode in _alternatives(r['_cand']):
-                a = evaluate_root_candidate(baseline, alt, FitConfig(fit.iterations, mode, fit.cycle_tol))
-                r['initialisations'].append({'fraction': a['initial_fraction'], 'mode': mode,
-                                             'fresh_marginal_LH': a['fresh_marginal_LH']})
-                if a['fresh_marginal_LH'] > r['fresh_marginal_LH']:
-                    keep = {k: r[k] for k in ('source', 'regression_rank', 'regression_chisq', 'initialisations',
-                                              '_cand', 'initial_fraction')}
-                    keep['warnings'] = r['warnings'] + a['warnings'] + ['best score from alternative initialisation']
-                    a.pop('warnings')
-                    r.update(a)
-                    r.update(keep)
+        todo = [(r, alt, mode) for r in results if not (r['failed'] or r['delta_LH'] < -sensitivity_window)
+                for alt, mode in _alternatives(r['_cand'])]
+        alts = _map_eval(baseline, [(alt, FitConfig(fit.iterations, mode, fit.cycle_tol)) for _, alt, mode in todo],
+                         n_jobs, catch_errors)
+        for (r, alt, mode), a in zip(todo, alts):
+            r['initialisations'].append({'fraction': a['initial_fraction'], 'mode': mode,
+                                         'fresh_marginal_LH': a['fresh_marginal_LH']})
+            if a['fresh_marginal_LH'] > r['fresh_marginal_LH']:
+                keep = {k: r[k] for k in ('source', 'regression_rank', 'regression_chisq', 'initialisations',
+                                          '_cand', 'initial_fraction', 'candidate_id')}
+                keep['best_initialisation'] = {'fraction': a['initial_fraction'], 'mode': mode}
+                keep['warnings'] = r['warnings'] + a['warnings'] + ['best score from alternative initialisation']
+                a.pop('warnings')
+                r.update(a)
+                r.update(keep)
         best = finalize()
     for r in results:
         sc = [i['fresh_marginal_LH'] for i in r['initialisations'] if np.isfinite(i['fresh_marginal_LH'])]
