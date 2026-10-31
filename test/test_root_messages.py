@@ -213,3 +213,53 @@ def test_estimate_outgroup_distance(b20, fitted):
     assert 0.05 < d < 0.2
     for f in (0.8, 1.25):
         assert root_message_correction(copy.deepcopy(tt), outgroup_leaf_messages(gtr, og, d * f))['combined'] < best
+
+
+def _contradictory(tt, n=10, weak=1e-3):
+    """Messages for a state other than the root's most probable one at n
+    confidently reconstructed columns (other states ``weak``; far below 1e-3 the
+    preorder pass's 1e-12 profile floor starts to bias root-edge profiles)."""
+    fresh_marginal_score(tt)
+    prof = tt.tree.root.marginal_profile[tt.data.full_to_compressed_sequence_map]
+    cols = np.nonzero(prof.max(axis=1) > 0.99)[0][:n]
+    m = {}
+    for p in cols:
+        v = np.full(prof.shape[1], weak)
+        v[(int(np.argmax(prof[p])) + 1) % prof.shape[1]] = 1.0
+        m[int(p)] = v
+    return m
+
+
+def test_root_edges_fitted_separately_with_messages(b20, fitted):
+    """With messages at a bifurcating root, the two root edges are separate
+    branches: optimize_tree must not merge them (the message would sit at one
+    end). Each root edge's marginal optimum equals the 1-D optimum of the exact
+    combined likelihood, and the fit does not depend on the order of the root's
+    children."""
+    from scipy.optimize import minimize_scalar
+    b, true = b20
+    m = _contradictory(copy.deepcopy(fitted.state))
+    fits = []
+    for reverse in (False, True):
+        ta = TreeAnc(tree=b.rooted_phylo(true), aln=b.aln, gtr=copy.deepcopy(b.gtr), verbose=0, rng_seed=b.rng_seed)
+        ta.set_root_state_messages(m)
+        if reverse:
+            ta.tree.root.clades.reverse()
+        ta.optimize_tree(max_iter=2, method_anc='probabilistic', branch_length_mode='marginal')
+        fits.append({c.name: c.branch_length for c in ta.tree.root.clades})
+    assert fits[0].keys() == fits[1].keys()
+    for k in fits[0]:
+        assert fits[0][k] == pytest.approx(fits[1][k], rel=1e-9, abs=1e-12)
+    # per-edge optimum against direct scoring, everything else fixed
+    fresh_marginal_score(ta)
+    ta.infer_ancestral_sequences(marginal=True)
+    for c in ta.tree.root.clades:
+        t_marg = ta.optimal_marginal_branch_length(c, tol=1e-10)
+        tt2 = copy.deepcopy(ta)
+        node = [x for x in tt2.tree.root.clades if x.name == c.name][0]
+
+        def neg(t):
+            node.branch_length = node.mutation_length = t
+            return -fresh_marginal_score(tt2)
+        t_brute = minimize_scalar(neg, bounds=(1e-6, 1.0), method='bounded', options={'xatol': 1e-9}).x
+        assert t_marg == pytest.approx(t_brute, rel=2e-3, abs=2e-5)

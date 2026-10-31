@@ -842,7 +842,8 @@ class TreeAnc(object):
             keys = None
         else:
             keys, table, log_scale = normalise_root_messages(messages, self.data.full_length, len(self.gtr.alphabet))
-            self.root_state_message = {'keys': keys, 'table': table, 'log_scale': log_scale}
+            # all-neutral messages are no messages: every code path stays the plain one
+            self.root_state_message = {'keys': keys, 'table': table, 'log_scale': log_scale} if keys.any() else None
         self.data.refine_patterns(keys)
         self._reset_reconstruction()
 
@@ -1398,8 +1399,9 @@ class TreeAnc(object):
             for n in self.tree.find_clades():
                 if n.up is None:
                     continue
-                if n.up.up is None and len(n.up.clades) == 2:
-                    # children of a bifurcating root!
+                if n.up.up is None and len(n.up.clades) == 2 and self.root_state_message is None:
+                    # children of a bifurcating root! (merged into one branch: exact only when the
+                    # root carries the stationary prior; with root-state messages each edge is fitted)
                     n1, n2 = n.up.clades
                     total_bl = n1.branch_length + n2.branch_length
                     bl_ratio = n1.branch_length / total_bl
