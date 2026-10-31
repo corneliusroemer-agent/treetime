@@ -298,8 +298,14 @@ def apply_candidate_root(baseline_tree, candidate, fraction=None):
         clade, parent, child_is_split_side = _find_edge(tree, candidate.split)
         w = clade.branch_length or 0.0
         d_child = f * w if child_is_split_side else (1.0 - f) * w
-        # new root inside the edge, at distance d_child from `clade`
-        tree.root_with_outgroup(clade, outgroup_branch_length=d_child)
+        # insert a degree-2 node into the edge at distance d_child from `clade` and
+        # root there. Not root_with_outgroup(clade, outgroup_branch_length=...):
+        # when `clade` is a child of a multifurcating root, Biopython keeps the
+        # full edge length on the other side as well.
+        mid = Phylo.BaseTree.Clade(branch_length=w - d_child, clades=[clade])
+        parent.clades[parent.clades.index(clade)] = mid
+        clade.branch_length = d_child
+        tree.root_with_outgroup(mid)  # internal node, no length: it becomes the root
     tree.root.branch_length = 0.0
     return tree
 
@@ -376,6 +382,7 @@ class FitRun:
     treetime_stop_iteration: Optional[int] = None  # where run() would have stopped on ndiff == 0
     runtime: float = 0.0
     error: Optional[str] = None
+    warnings: list = field(default_factory=list)
     state: object = None  # deep copy of the TreeTime at the best score
 
 
@@ -421,6 +428,7 @@ class CandidateResult:
             'optimiser_spread': self.optimiser_spread,
             'runtime': sum(r.runtime for r in self.runs),
             'error': '; '.join(r.error for r in self.runs if r.error) or None,
+            'warnings': '; '.join(sorted({w for r in self.runs for w in r.warnings})) or None,
             **self.root,
         }
 
@@ -463,7 +471,7 @@ class RootSearchResult:
             'id', 'type', 'label', 'source', 'regression_rank', 'regression_chisq', 'initial_fraction',
             'logL', 'delta_logL', 'positional_LH', 'cached_LH', 'clock_rate', 'root_date', 'root_degree',
             'split_ratio', 'root_child_branch_lengths', 'best_iteration', 'fits_performed', 'trajectory',
-            'treetime_stop_iteration', 'n_inits', 'optimiser_spread', 'runtime', 'error', 'scores',
+            'treetime_stop_iteration', 'n_inits', 'optimiser_spread', 'runtime', 'error', 'warnings', 'scores',
         ]
         lines = ['\t'.join(cols)]
         for r in self.rows():
@@ -571,7 +579,8 @@ class RootCandidateEvaluator:
         self.treetime_kwargs = dict(treetime_kwargs or {})
         self._regression = None
         if clock_rate is None:
-            ranked = self.regression_ranking()
+            # free-slope regression, not cached: candidate ranking later uses the fixed rate
+            ranked = self.regression_ranking(slope=None)
             if not ranked:
                 raise ValueError('no root with a positive regression slope; pass clock_rate')
             clock_rate = float(ranked[0]['slope'])
@@ -615,7 +624,7 @@ class RootCandidateEvaluator:
         tt.optimize_tree(infer_gtr=False, max_iter=1, method_anc='probabilistic', **treetime_seq_kwargs())
         for n in tt.tree.find_clades():
             n.branch_length = n.mutation_length
-        s = getattr(self, 'clock_rate', None) if slope == 'fixed' else slope
+        s = self.clock_rate if slope == 'fixed' else slope
         treg = tt.setup_TreeRegression(covariation=covariation)
         ranked = treg.rank_roots(force_positive=True, slope=s)
         # translate to baseline candidates (tt.tree has the baseline topology and root)
@@ -670,6 +679,15 @@ class RootCandidateEvaluator:
         try:
             tree = apply_candidate_root(self.baseline, candidate, fraction=fraction)
             tt = self.new_treetime(tree)
+            kids = tt.tree.root.clades
+            if len(kids) == 2 and kids[0].branch_length + kids[1].branch_length <= 0:
+                # TreeTime's marginal branch-length step keeps the ratio of the two
+                # root-incident edges and divides by their sum; give a zero-length
+                # root edge one mutation, split equally (the dated fit moves it anyway)
+                f = 0.5
+                for c, share in zip(kids, (f, 1 - f)):
+                    c.branch_length = c.mutation_length = share * tt.one_mutation
+                run.warnings.append('zero-length root edge: initial length set to one mutation')
             seq_kwargs = treetime_seq_kwargs()
             tt_kwargs = {'clock_rate': self.clock_rate, 'time_marginal': False}
             tt.use_covariation = False
