@@ -98,6 +98,8 @@ from treetime.root_candidates import (  # noqa: E402
     fit_rate_profile,
     profile_rate_point,
     rescale_times_for_rate,
+    fitted_root_candidate,
+    merge_duplicate_roots,
 )
 
 FIT1 = FitConfig(iterations=1)
@@ -300,9 +302,10 @@ def test_known_root_and_close_candidate_diagnostics(b20):
     assert res.best.rate_fitted and sum(r.rate_fitted for r in res.results) >= 3
     assert all(r.rate_fitted for r in res.results if r.regression_rank == 1)
     top_ = res.best
-    for r in res.results[1:]:
+    for r in res.distinct[1:]:
         assert r.resolved_from_best == (-r.delta_logL > max(res.min_margin, top_.uncertainty + r.uncertainty))
-    assert res.best_is_resolved == all(r.resolved_from_best for r in res.results[1:])
+    assert all(r.resolved_from_best is None for r in res.results if r.duplicate_of)
+    assert res.best_is_resolved == all(r.resolved_from_best for r in res.distinct[1:])
     # only the best run of each candidate keeps a TreeTime copy
     assert all((x.state is not None) == (x is r.best_run) for r in res.results for x in r.runs)
     rows = res.rows()
@@ -698,3 +701,76 @@ def test_rescale_times_for_rate_keeps_divergences(refit_pair):
             assert t_max - n1.numdate == pytest.approx(2 * (t_max - n0.numdate))
         if n0.up is not None and not n0.is_terminal():
             assert n1.branch_length == pytest.approx(n0.branch_length, rel=1e-9)  # internal edges: same divergence
+
+
+# --------------------------------------------------------------------------
+# duplicate rooted trees: edge fits that collapse onto a node
+# --------------------------------------------------------------------------
+def test_fitted_root_candidate_collapses_within_tolerance(b20):
+    v = hub(b20)
+    w = next(x for x in sorted(b20.adj[v]) if b20.toward_ref.get(x) == v)  # child of v away from the reference
+    e = b20.edge(w, 0.5)
+    a, b = b20.node_of[e.split], b20.toward_ref[b20.node_of[e.split]]
+    assert b == v
+    root = lambda la, lb: {'fitted_fraction': la / (la + lb), 'root_children': [a, b], 'root_child_lengths': [la, lb],
+                           'n_sites': 1000}
+    # 0.04 expected mutations from v: v's tree; 0.06: still the edge, at its fitted fraction
+    assert fitted_root_candidate(b20, e, root(0.01, 0.04e-3)) == (NodeRoot(b20.split_of[v]), 1.0)
+    cand, frac = fitted_root_candidate(b20, e, root(0.01, 0.06e-3))
+    assert cand == EdgeRoot(e.split, frac) and 0.99 < frac < 1.0
+    assert fitted_root_candidate(b20, e, root(0.01, 0.06e-3), tol=0.1)[0] == NodeRoot(b20.split_of[v])
+    if not b20.is_leaf(a):
+        assert fitted_root_candidate(b20, e, root(0.0, 0.01)) == (NodeRoot(b20.split_of[a]), 0.0)
+    node = NodeRoot(b20.split_of[v])
+    assert fitted_root_candidate(b20, node, {'fitted_fraction': None}) == (node, None)
+
+
+@pytest.fixture(scope='module')
+def dup_ranking():
+    """poly20: node INT_0005 and its incident edge to L17, whose fit collapses onto INT_0005, plus node INT_0004."""
+    b = make_baseline('poly20')
+    explicit = [b.node('INT_0005'), b.edge('L17', 0.5, 'INT_0005'), b.node('INT_0004')]
+    return b, rank_root_candidates(b, explicit=explicit, regression_k=0, candidate_sources=(), fit=FIT2)
+
+
+def test_duplicate_roots_are_merged_and_margins_compare_distinct_trees(dup_ranking):
+    b, res = dup_ranking
+    by = {r.candidate_id: r for r in res.results}
+    e, n5, n4 = by['edge:L17-INT_0005'], by['node:INT_0005'], by['node:INT_0004']
+    assert e.root_id == n5.root_id == 'node:INT_0005' and n4.root_id == 'node:INT_0004'
+    assert e.root_fraction == 1.0 and n5.root_fraction is None
+    rep, dup = (e, n5) if e.score >= n5.score else (n5, e)
+    assert abs(e.score - n5.score) < 0.05  # the same tree, fitted twice
+    assert dup.duplicate_of == rep.candidate_id and rep.duplicate_of is None and dup.resolved_from_best is None
+    assert rep.merged == [{'candidate_id': dup.candidate_id, 'source': dup.source, 'logL': dup.score}]
+    assert [r.candidate_id for r in res.distinct] == [r.candidate_id for r in res.results if r is not dup]
+    # the margin is between distinct trees, never the ~0 gap between the duplicates
+    d = res.distinct
+    assert res.margin == d[0].score - d[1].score and res.margin > 0.5
+    assert dup.candidate_id not in res.unresolved_with_best
+    s = res.summary()
+    assert s['best_root'] == res.best.root_id and s['n_distinct'] == 2 and s['n_candidates'] == 3
+    row = {r['candidate_id']: r for r in res.rows()}
+    assert row[dup.candidate_id]['duplicate_of'] == rep.candidate_id
+    assert row[rep.candidate_id]['merged_ids'] == [dup.candidate_id]
+    assert '= ' + rep.candidate_id in res.table() and 'root_id' in res.to_tsv()
+
+
+@pytest.mark.parametrize('fx', ['binary20', 'poly20'])
+def test_duplicate_merge_never_changes_the_winner(fx):
+    """Merging relabels and changes margins only: order, scores and the winning fitted tree are those
+    without merging (collapse_tol < 0 disables it)."""
+    b = make_baseline(fx)
+    res = rank_root_candidates(b, fit=FIT1)
+    plain = copy.copy(res)
+    plain.results = [copy.copy(r) for r in res.results]
+    merge_duplicate_roots(b, plain.results, tol=-1.0)
+    assert [r.candidate_id for r in res.results] == [r.candidate_id for r in plain.results]
+    assert [r.score for r in res.results] == [r.score for r in plain.results]
+    assert res.best.best_run is plain.best.best_run and res.best.duplicate_of is None
+    assert all(r.duplicate_of is None for r in plain.results)
+    # every duplicate is the same fitted tree as its representative, within fit noise
+    rep = {r.candidate_id: r for r in res.results}
+    for r in res.results:
+        if r.duplicate_of:
+            assert rep[r.duplicate_of].root_id == r.root_id and rep[r.duplicate_of].score >= r.score

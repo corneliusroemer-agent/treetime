@@ -43,6 +43,7 @@ from .treetime import TreeTime
 
 EDGE_ROOT_NAME = 'EDGE_ROOT'
 ENDPOINT_TOL = 1e-5  # same tolerance as TreeRegression.optimal_reroot
+COLLAPSE_TOL = 0.05  # expected mutations: a fitted edge root this close to an endpoint is that node's tree
 FIT_ERRORS = (TreeTimeError, ValueError, ZeroDivisionError, FloatingPointError)
 
 
@@ -481,7 +482,34 @@ def _root_summary(baseline, cand, tt):
         'root_children': [c.name for c in kids],
         'root_child_lengths': bls,
         'fitted_fraction': frac,
+        'n_sites': int(tt.data.full_length),
     }
+
+
+def fitted_root_candidate(baseline, cand, root, tol=COLLAPSE_TOL):
+    """The rooted tree a fit actually reached: ``(candidate, fitted fraction)``.
+
+    A node candidate is its own tree (fraction ``None``). An edge candidate whose
+    fitted root lies within ``tol`` expected mutations (branch length x number of
+    sites) of an endpoint is the tree rooted at that endpoint, the same rooted
+    tree as that node's candidate and as every other incident edge that
+    collapsed there. Otherwise it stays the edge root, at its fitted fraction
+    (measured from the endpoint away from the reference leaf, as
+    :class:`EdgeRoot`'s ``fraction``)."""
+    if not isinstance(cand, EdgeRoot) or not root or root.get('fitted_fraction') is None:
+        return cand, None
+    frac = float(root['fitted_fraction'])
+    lengths = dict(zip(root['root_children'], root['root_child_lengths']))
+    a = baseline.node_of[cand.split]
+    la = lengths.get(a)
+    lb = sum(v for k, v in lengths.items() if k != a)
+    n = root.get('n_sites')
+    if la is not None and n:
+        if la * n <= tol and la <= lb:
+            return baseline.canonical(EdgeRoot(cand.split, 0.0)), 0.0
+        if lb * n <= tol:
+            return baseline.canonical(EdgeRoot(cand.split, 1.0)), 1.0
+    return EdgeRoot(cand.split, frac), frac
 
 
 def _rescale_rate(tt, mu):
@@ -870,6 +898,11 @@ class CandidateResult:
     delta_logL: Optional[float] = None
     resolved_from_best: Optional[bool] = None
     rate_fitted: bool = False
+    root_candidate: object = None  # the rooted tree the best fit reached (fitted_root_candidate)
+    root_id: Optional[str] = None
+    root_fraction: Optional[float] = None  # fitted fraction on the edge; None for a node root
+    duplicate_of: Optional[str] = None  # candidate_id of the better-scoring result with the same rooted tree
+    merged: list = field(default_factory=list)  # on a representative: [{candidate_id, source, logL}] of its duplicates
 
     @property
     def best_run(self):
@@ -929,6 +962,11 @@ class CandidateResult:
             'init_spread': self.init_spread,
             'uncertainty': self.uncertainty if ok else None,
             'resolved_from_best': self.resolved_from_best,
+            'root_id': self.root_id,
+            'root_fraction': self.root_fraction,
+            'duplicate_of': self.duplicate_of,
+            'merged_ids': [m['candidate_id'] for m in self.merged] or None,
+            'merged_sources': [m['source'] for m in self.merged] or None,
             'runtime': sum(r.runtime for r in self.runs),
             'error': '; '.join(r.error for r in self.runs if r.error) or None,
             'warnings': '; '.join(sorted({w for r in self.runs for w in r.warnings})) or None,
@@ -946,7 +984,8 @@ TSV_COLS = ['candidate_id', 'stable_id', 'kind', 'source', 'source_ranks', 'regr
             'positional_LH', 'cached_LH', 'clock_rate', 'rate_fitted', 'initial_fraction', 'initial_mode', 'fitted_fraction',
             'root_date', 'root_degree', 'root_child_lengths', 'iterations_performed', 'best_iteration',
             'treetime_stop_iteration', 'trajectory_class', 'tail_fluctuation', 'n_initialisations',
-            'init_spread', 'uncertainty', 'resolved_from_best', 'runtime', 'error', 'warnings', 'scores']
+            'init_spread', 'uncertainty', 'resolved_from_best', 'root_id', 'root_fraction', 'duplicate_of', 'merged_ids',
+            'runtime', 'error', 'warnings', 'scores']
 
 
 @dataclass
@@ -962,15 +1001,24 @@ class RootSearchResult:
         return self.results[0]
 
     @property
+    def distinct(self):
+        """Results with distinct fitted rooted trees, best first: duplicates (an
+        edge candidate whose fit collapsed onto a node another candidate also
+        reached) are left out; their labels and sources are in the
+        representative's ``merged``."""
+        return [r for r in self.results if r.duplicate_of is None]
+
+    @property
     def margin(self):
-        """logL gap between the best and the second candidate."""
-        if len(self.results) < 2 or not np.isfinite(self.results[1].score):
+        """logL gap between the best and the second distinct rooted tree."""
+        d = self.distinct
+        if len(d) < 2 or not np.isfinite(d[1].score):
             return None
-        return self.results[0].score - self.results[1].score
+        return d[0].score - d[1].score
 
     @property
     def unresolved_with_best(self):
-        return [r.candidate_id for r in self.results[1:] if not r.resolved_from_best]
+        return [r.candidate_id for r in self.distinct[1:] if not r.resolved_from_best]
 
     @property
     def best_is_resolved(self):
@@ -1013,6 +1061,8 @@ class RootSearchResult:
         reg = self.regression_best
         out = {
             'best': self.best.candidate_id,
+            'best_root': self.best.root_id,
+            'best_root_fraction': self.best.root_fraction,
             'best_logL': self.best.score,
             'margin': self.margin,
             'best_is_resolved': self.best_is_resolved,
@@ -1022,6 +1072,7 @@ class RootSearchResult:
             'clock_rate': self.clock_rate,
             'min_margin': self.min_margin,
             'n_candidates': len(self.results),
+            'n_distinct': len(self.distinct),
             'n_failed': sum(not np.isfinite(r.score) for r in self.results),
         }
         ref = self.final_rate_refit
@@ -1059,10 +1110,10 @@ class RootSearchResult:
                 i + 1, r['candidate_id'][:28], r['source'][:19], _fmt(r['regression_rank']), _fmt(r['logL'], 3),
                 _fmt(r['delta_logL'], 3), _fmt(r['uncertainty'], 2), _fmt(r['root_date'], 2),
                 _fmt(r['root_degree']), _fmt(r['best_iteration']), r['trajectory_class'] or '',
-                '' if i == 0 else _fmt(r['resolved_from_best'])))
+                '' if i == 0 else ('= ' + r['duplicate_of']) if r['duplicate_of'] else _fmt(r['resolved_from_best'])))
         s = self.summary()
-        out.append('best %s, margin %s, %s; regression best %s (dlogL %s)' % (
-            s['best'], _fmt(s['margin'], 3), 'resolved' if s['best_is_resolved'] else
+        out.append('best %s (root %s), margin %s, %s; regression best %s (dlogL %s)' % (
+            s['best'], s['best_root'], _fmt(s['margin'], 3), 'resolved' if s['best_is_resolved'] else
             'unresolved with ' + ', '.join(s['unresolved_with_best']), s['regression_best'],
             _fmt(s['regression_best_delta_logL'], 3)))
         ref = self.final_rate_refit
@@ -1241,13 +1292,40 @@ def final_rate_refit_summary(ref):
 
 
 
+def merge_duplicate_roots(baseline, results, tol=COLLAPSE_TOL):
+    """Label each result (sorted best first) by its fitted rooted tree and mark
+    duplicates in place. The first (best-scoring) result reaching a tree
+    represents it; later ones get ``duplicate_of`` and are listed in the
+    representative's ``merged``. Failed fits keep their own label and are
+    never merged."""
+    reps = {}
+    for r in results:
+        r.duplicate_of, r.merged = None, []
+        b = r.best_run
+        ok = b is not None and b.error is None and np.isfinite(r.score)
+        root, frac = fitted_root_candidate(baseline, r.candidate, b.root if ok else None, tol)
+        r.root_candidate, r.root_fraction = root, frac
+        r.root_id = baseline.candidate_id(root)
+        if not ok:
+            continue
+        key = candidate_key(root)
+        if key in reps:
+            rep = reps[key]
+            r.duplicate_of = rep.candidate_id
+            rep.merged.append({'candidate_id': r.candidate_id, 'source': r.source, 'logL': r.score})
+        else:
+            reps[key] = r
+    return results
+
+
 def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=None,
                          sensitivity_fractions=(0.1, 0.5, 0.9), min_margin=1.0, covariation=None,
                          tip_slack=None, keep_states=True, catch_errors=False, rate_rounds=0, rate_fit_window=5.0,
                          rate_fit_min=3, rate_fit_max=15, rate_fit_extra=(), warm_starts=None,
                          candidate_sources=None, ranked_sources=None, evaluator=None, final_rate_refit=False,
                          final_rate_evals=FINAL_RATE_EVALS, final_rate_xatol=FINAL_RATE_XATOL,
-                         final_rate_iterations=FINAL_RATE_ITERATIONS, final_rate_refit_window=None):
+                         final_rate_iterations=FINAL_RATE_ITERATIONS, final_rate_refit_window=None,
+                         collapse_tol=COLLAPSE_TOL):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
@@ -1356,6 +1434,15 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     ``keep_states=False`` keeps no TreeTime copies; otherwise only the best run
     of each candidate keeps its copy.
 
+    **Duplicate rooted trees** (:func:`merge_duplicate_roots`). After fitting,
+    each candidate is labelled by the rooted tree its best fit reached
+    (``root_id``, ``root_fraction``): an edge root within ``collapse_tol``
+    expected mutations of an endpoint is that node's tree. Results that reached
+    the same tree are duplicates: the best-scoring one represents it and lists
+    the others in ``merged``; the others get ``duplicate_of`` and no verdict.
+    ``margin``, ``resolved_from_best`` and ``unresolved_with_best`` compare
+    distinct trees only. The order, the scores and the winner are unchanged.
+
     ``evaluator``: replaces :func:`evaluate_root_candidate` (same signature and
     return type) for every fit; Stage 3 passes an
     :class:`~treetime.outgroup_subtree.OutgroupEvaluator`, whose messages depend
@@ -1439,11 +1526,12 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         if refit is not None:
             for c in [refit] + refit.get('close', []):
                 c['state'] = None
+    merge_duplicate_roots(baseline, results, collapse_tol)
     if results:
         top = results[0]
         for r in results:
             r.delta_logL = r.score - top.score if np.isfinite(r.score) else None
-            r.resolved_from_best = True if r is top else bool(
+            r.resolved_from_best = None if r.duplicate_of else True if r is top else bool(
                 np.isfinite(r.score) and -r.delta_logL > max(min_margin, top.uncertainty + r.uncertainty))
     config = {
         'branch_length_mode': 'marginal', 'Tc': None, 'resolve_polytomies': False, 'prune_short': False,
@@ -1454,7 +1542,7 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         'sensitivity_window': sensitivity_window, 'sensitivity_fractions': list(sensitivity_fractions),
         'min_margin': min_margin, 'rate_rounds': rate_rounds, 'rate_fit_window': rate_fit_window,
         'rate_fit_min': rate_fit_min, 'rate_fit_max': rate_fit_max, 'rate_span': fit.rate_span,
-        'rate_clamp': fit.rate_clamp, 'warm_starts': len(warm_starts),
+        'rate_clamp': fit.rate_clamp, 'warm_starts': len(warm_starts), 'collapse_tol': collapse_tol,
     }
     if final_rate_refit:
         config.update({'final_rate_refit': True, 'final_rate_evals': final_rate_evals,

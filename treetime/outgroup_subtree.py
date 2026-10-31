@@ -455,7 +455,8 @@ class Stage3Result:
 
     def summary(self):
         return {'stage1_best': self.stage1.best.candidate_id, 'stage1_margin': self.stage1.margin,
-                'stage3_best': self.stage3.best.candidate_id, 'stage3_margin': self.stage3.margin,
+                'stage3_best': self.stage3.best.candidate_id, 'stage3_best_root': self.stage3.best.root_id,
+                'stage3_margin': self.stage3.margin,
                 'stage3_resolved': self.stage3.best_is_resolved,
                 'n_candidates': len(self.rows), 'n_extra': len(self.extra)}
 

@@ -195,7 +195,8 @@ class Stage2Result:
             'stage1_best': self.stage1.best.candidate_id, 'stage1_margin': self.stage1.margin,
             'stage1_resolved': self.stage1.best_is_resolved,
             'stage2a_best': self.best('combined_2a'), 'stage2a_margin': self.margin('combined_2a'),
-            'stage2b_best': self.stage2b.best.candidate_id, 'stage2b_margin': self.stage2b.margin,
+            'stage2b_best': self.stage2b.best.candidate_id, 'stage2b_best_root': self.stage2b.best.root_id,
+            'stage2b_margin': self.stage2b.margin,
             'stage2b_resolved': self.stage2b.best_is_resolved,
         }
         for name, res in (('stage1', self.stage1), ('stage2b', self.stage2b)):
