@@ -24,6 +24,9 @@ Layout
   whether the best candidate is resolved from the others.
 * :func:`plot_root_candidates` -- the tree with every candidate coloured by its
   likelihood deficit from the best.
+* :func:`rank_with_root_messages` -- external root-state messages
+  (:mod:`treetime.root_messages`): Stage 1, post-hoc rescoring (2a) and a full
+  refit with the messages in every fit (2b), side by side.
 """
 import copy
 import io
@@ -135,9 +138,10 @@ class UnrootedBaseline:
         self.gtr = gtr if isinstance(gtr, GTR) else GTR.standard(gtr)
         self.rng_seed = rng_seed
         self.tt_kwargs = dict(tt_kwargs or {})
+        self.root_state_messages = None  # see with_root_state_messages
         self._from_phylo(tree)
         if optimize_baseline:
-            tt = self.make_treetime(self.rooted_phylo(None))
+            tt = self.make_treetime(self.rooted_phylo(None), messages=False)
             tt.optimize_tree(infer_gtr=False, max_iter=1, method_anc='probabilistic', **_seq_kwargs())
             self._from_phylo(tt.tree, keep_names=True)
         if clock_rate is None:
@@ -291,17 +295,32 @@ class UnrootedBaseline:
             root.clades = [build(a, b, w * cand.fraction), build(b, a, w * (1.0 - cand.fraction))]
         return Tree(root=root, rooted=True)
 
-    def make_treetime(self, tree):
-        """New TreeTime object on ``tree``: same alignment, dates, model and seed."""
+    def make_treetime(self, tree, messages=True):
+        """New TreeTime object on ``tree``: same alignment, dates, model and seed;
+        with the baseline's external root-state messages unless ``messages=False``."""
         kw = dict(verbose=0, branch_length_mode='marginal', use_covariation=False)
         kw.update(self.tt_kwargs)
-        return TreeTime(tree=tree, aln=self.aln, dates=self.dates, gtr=copy.deepcopy(self.gtr),
-                        rng_seed=self.rng_seed, **kw)
+        tt = TreeTime(tree=tree, aln=self.aln, dates=self.dates, gtr=copy.deepcopy(self.gtr),
+                      rng_seed=self.rng_seed, **kw)
+        if messages and self.root_state_messages is not None:
+            tt.set_root_state_messages(self.root_state_messages)
+        return tt
+
+    def with_root_state_messages(self, messages):
+        """Copy of this baseline (same topology, branch lengths, model and clock
+        rate) whose candidate fits carry external root-state messages
+        (:meth:`TreeAnc.set_root_state_messages`; ``None`` removes them). Only
+        candidate fits use them: the baseline branch lengths and the regression
+        are rooting-independent and stay as they are."""
+        from .root_messages import RootStateMessages
+        other = copy.copy(self)
+        other.root_state_messages = None if messages is None else RootStateMessages(messages, self.gtr.n_states)
+        return other
 
     def regression(self, covariation=False, tip_slack=None):
         """TreeRegression on the baseline branch lengths. ``tip_slack`` sets the
         extra tip variance of the covariation model (TreeTime's default if None)."""
-        tt = self.make_treetime(self.rooted_phylo(None))
+        tt = self.make_treetime(self.rooted_phylo(None), messages=False)
         if tip_slack is not None:
             tt.tip_slack = tip_slack
         treg = tt.setup_TreeRegression(covariation=covariation)
@@ -362,13 +381,16 @@ def fitted_newick(tt):
     return buf.getvalue().strip()
 
 
-def score_newick(baseline, newick):
+def score_newick(baseline, newick, messages=None):
     """Marginal log-likelihood of the baseline alignment on a tree given as a
-    newick string, at exactly its branch lengths, with a new TreeAnc object."""
+    newick string, at exactly its branch lengths, with a new TreeAnc object
+    (with external root-state ``messages`` if given)."""
     from .treeanc import TreeAnc
     tree = Phylo.read(io.StringIO(newick), 'newick')
     ta = TreeAnc(tree=tree, aln=baseline.aln, gtr=copy.deepcopy(baseline.gtr), verbose=0,
                  rng_seed=baseline.rng_seed)
+    if messages is not None:
+        ta.set_root_state_messages(messages)
     return fresh_marginal_score(ta)
 
 
@@ -952,6 +974,189 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     }
     return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config)
 
+
+
+# --------------------------------------------------------------------------
+# external root-state messages (Stage 2)
+# --------------------------------------------------------------------------
+def score_with_root_messages(tt, messages, sites=()):
+    """Post-hoc (Stage 2a) score of the fitted tree ``tt`` with external
+    root-state messages, at its current branch lengths, without changing its
+    compression or its fit.
+
+    ``tt`` must carry no messages of its own. Returns a dict with ``ingroup``
+    (the fresh marginal logL, as Stage 1 ranks), ``combined`` = sum over sites
+    of log sum_a pi_a l_i(a) m_i(a), ``correction`` = combined - ingroup, and
+    ``posterior`` {site: root-state posterior with the messages} and
+    ``posterior_ingroup`` {site: without} for the requested ``sites``.
+    Positions merged into one compressed pattern but carrying different messages
+    are handled as a grouped sidecar (:meth:`RootStateMessages.groups`).
+    """
+    from .root_messages import RootStateMessages
+    if tt.root_state_messages is not None:
+        raise ValueError('score_with_root_messages: tt already carries root-state messages')
+    msgs = RootStateMessages(messages, tt.gtr.n_states, length=tt.data.full_length)
+    ingroup = fresh_marginal_score(tt)
+    root = tt.tree.root
+    pi = tt.gtr.Pi if tt.gtr.Pi.ndim == 1 else None
+    if pi is None:
+        raise NotImplementedError('score_with_root_messages: site-specific GTR models')
+    lhat, pref = root.marginal_subtree_LH, root.marginal_subtree_LH_prefactor
+    pat, tag, cnt = msgs.groups(tt.data)
+    u, c = msgs.tag_vectors[tag], msgs.tag_log_scale[tag]
+    per_group = pref[pat] + np.log(np.sum(pi * lhat[pat] * u, axis=1)) + c
+    combined = float(np.sum(cnt * per_group))
+    post, post0 = {}, {}
+    f2c = tt.data.full_to_compressed_sequence_map
+    for site in sites:
+        g = f2c[site]
+        k = msgs.tag_of_position.get(int(site), 0)
+        p0 = pi * lhat[g]
+        p = p0 * msgs.tag_vectors[k]
+        post0[int(site)] = p0 / p0.sum()
+        post[int(site)] = p / p.sum()
+    return {'ingroup': ingroup, 'combined': combined, 'correction': combined - ingroup,
+            'posterior': post, 'posterior_ingroup': post0}
+
+
+def root_posterior(tt, sites):
+    """{site: root-state posterior} of a fitted ``tt`` (with whatever messages it
+    carries), recomputed at its current branch lengths."""
+    fresh_marginal_score(tt)
+    f2c = tt.data.full_to_compressed_sequence_map
+    return {int(s): np.array(tt.tree.root.marginal_profile[f2c[s]]) for s in sites}
+
+
+@dataclass
+class RootMessageResult:
+    """Stage 1, Stage 2a (post-hoc) and Stage 2b (refitted) results side by side.
+
+    ``stage1``: :class:`RootSearchResult` without messages. ``stage2b``: the same
+    candidate set ranked with the messages in every fit (None if not run).
+    ``rows``: one dict per candidate, Stage 1 order (see :meth:`table`).
+    """
+
+    stage1: object
+    stage2b: object
+    rows: list
+    sites: list
+
+    def _best(self, col):
+        ok = [r for r in self.rows if r.get(col) is not None and np.isfinite(r[col])]
+        return max(ok, key=lambda r: r[col]) if ok else None
+
+    @property
+    def best_stage1(self):
+        return self.rows[0]['candidate_id'] if self.rows else None
+
+    @property
+    def best_2a(self):
+        b = self._best('combined_posthoc')
+        return b['candidate_id'] if b else None
+
+    @property
+    def best_2b(self):
+        return self.stage2b.best.candidate_id if self.stage2b is not None else None
+
+    def margin(self, col):
+        sc = sorted((r[col] for r in self.rows if r.get(col) is not None and np.isfinite(r[col])), reverse=True)
+        return sc[0] - sc[1] if len(sc) > 1 else None
+
+    def summary(self):
+        return {
+            'best_stage1': self.best_stage1, 'margin_stage1': self.stage1.margin,
+            'stage1_resolved': self.stage1.best_is_resolved,
+            'best_2a': self.best_2a, 'margin_2a': self.margin('combined_posthoc'),
+            'best_2b': self.best_2b, 'margin_2b': self.stage2b.margin if self.stage2b is not None else None,
+            'stage2b_resolved': self.stage2b.best_is_resolved if self.stage2b is not None else None,
+            'regression_best': self.stage1.summary()['regression_best'],
+        }
+
+    def table(self):
+        h = '%-28s %11s %10s %11s %11s %9s %9s %9s %s' % (
+            'candidate', 'ingroup', 'corr', 'comb_2a', 'logL_2b', '2b-2a', 'date_1', 'date_2b', 'root_lengths 1 -> 2b')
+        out = [h]
+        for r in self.rows:
+            out.append('%-28s %11s %10s %11s %11s %9s %9s %9s %s -> %s' % (
+                r['candidate_id'][:28], _fmt(r['ingroup'], 3), _fmt(r['correction'], 3),
+                _fmt(r['combined_posthoc'], 3), _fmt(r['logL_2b'], 3), _fmt(r['refit_minus_posthoc'], 3),
+                _fmt(r['root_date_1'], 2), _fmt(r['root_date_2b'], 2),
+                _fmt([round(x, 6) for x in r['root_child_lengths_1'] or []]),
+                _fmt([round(x, 6) for x in r['root_child_lengths_2b'] or []])))
+        s = self.summary()
+        out.append('stage1 best %s (margin %s, %s); 2a best %s (margin %s); 2b best %s (margin %s); regression best %s'
+                   % (s['best_stage1'], _fmt(s['margin_stage1'], 3), 'resolved' if s['stage1_resolved'] else 'unresolved',
+                      s['best_2a'], _fmt(s['margin_2a'], 3), s['best_2b'], _fmt(s['margin_2b'], 3),
+                      s['regression_best']))
+        return '\n'.join(out)
+
+    def to_json(self, path=None):
+        s = json.dumps({'summary': self.summary(), 'sites': self.sites, 'candidates': self.rows},
+                       indent=1, default=_json_default)
+        if path:
+            with open(path, 'w') as fh:
+                fh.write(s)
+        return s
+
+
+def rank_with_root_messages(baseline, messages, explicit=(), refit=True, sites=None, **rank_kwargs):
+    """Rank candidates with external root-state messages, in both stages.
+
+    1. Stage 1 (:func:`rank_root_candidates` on ``baseline`` without messages).
+    2. Stage 2a: every candidate's retained best Stage 1 state is re-scored with
+       the messages at its fitted branch lengths (:func:`score_with_root_messages`):
+       ingroup, correction and combined reported separately.
+    3. Stage 2b (``refit``): the same candidates (Stage 1's explicit and
+       regression candidates; the regression does not depend on the messages) are
+       ranked by :func:`rank_root_candidates` on
+       ``baseline.with_root_state_messages(messages)``, so the messages reach the
+       root posterior, internal profiles, branch-length and date optimisation and
+       the per-candidate rate fit. Selection machinery unchanged.
+
+    ``sites``: positions whose root posterior is reported (default: up to 5
+    message-carrying positions). ``rank_kwargs`` go to both rankings
+    (``keep_states`` is forced on: Stage 2a needs the states).
+    """
+    from .root_messages import RootStateMessages
+    msgs = RootStateMessages(messages, baseline.gtr.n_states)
+    if sites is None:
+        sites = msgs.positions[:5].tolist()
+    rank_kwargs['keep_states'] = True
+    s1 = rank_root_candidates(baseline, explicit=explicit, **rank_kwargs)
+    s2 = None
+    if refit:
+        s2 = rank_root_candidates(baseline.with_root_state_messages(msgs), explicit=explicit, **rank_kwargs)
+    by2 = {candidate_key(r.candidate): r for r in (s2.results if s2 else [])}
+    rows = []
+    for r in s1.results:
+        row = {'candidate_id': r.candidate_id, 'stable_id': stable_id(r.candidate), 'kind': r.candidate.kind,
+               'source': r.source, 'regression_rank': r.regression_rank, 'ingroup': None, 'correction': None,
+               'combined_posthoc': None, 'logL_2b': None, 'refit_minus_posthoc': None,
+               'root_date_1': None, 'root_date_2b': None, 'root_child_lengths_1': None,
+               'root_child_lengths_2b': None, 'root_children_1': None, 'root_children_2b': None,
+               'clock_rate_1': None, 'clock_rate_2b': None,
+               'posterior_ingroup': None, 'posterior_2a': None, 'posterior_2b': None,
+               'uncertainty_1': r.uncertainty if np.isfinite(r.score) else None, 'uncertainty_2b': None}
+        b = r.best_run
+        if np.isfinite(r.score) and b.state is not None:
+            sc = score_with_root_messages(copy.deepcopy(b.state), msgs, sites)
+            row.update(ingroup=sc['ingroup'], correction=sc['correction'], combined_posthoc=sc['combined'],
+                       posterior_ingroup=sc['posterior_ingroup'], posterior_2a=sc['posterior'],
+                       root_date_1=b.root.get('root_date'), root_child_lengths_1=b.root.get('root_child_lengths'),
+                       root_children_1=b.root.get('root_children'), clock_rate_1=b.clock_rate)
+        r2 = by2.get(candidate_key(r.candidate))
+        if r2 is not None and np.isfinite(r2.score):
+            b2 = r2.best_run
+            row.update(logL_2b=r2.score, root_date_2b=b2.root.get('root_date'),
+                       root_child_lengths_2b=b2.root.get('root_child_lengths'),
+                       root_children_2b=b2.root.get('root_children'), clock_rate_2b=b2.clock_rate,
+                       uncertainty_2b=r2.uncertainty)
+            if b2.state is not None:
+                row['posterior_2b'] = root_posterior(copy.deepcopy(b2.state), sites)
+            if row['combined_posthoc'] is not None:
+                row['refit_minus_posthoc'] = r2.score - row['combined_posthoc']
+        rows.append(row)
+    return RootMessageResult(stage1=s1, stage2b=s2, rows=rows, sites=[int(x) for x in sites])
 
 # --------------------------------------------------------------------------
 # plots (matplotlib imported lazily)

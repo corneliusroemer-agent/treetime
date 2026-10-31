@@ -161,6 +161,8 @@ class TreeAnc(object):
         self.ignore_missing_alns = ignore_missing_alns
         self.keep_node_order = keep_node_order
         self.rng = np.random.default_rng(seed=rng_seed)
+        self._root_messages = None  # RootStateMessages or None (see set_root_state_messages)
+        self._root_msg_compressed = None  # (normalised messages L'xn, log scale L') or None
         self._tree = None
         self.tree = tree
         if tree is None:
@@ -811,6 +813,84 @@ class TreeAnc(object):
         self.sequence_reconstruction = 'marginal'
         return N_diff
 
+    ####################################################################
+    ## external root-state messages
+    ####################################################################
+    @property
+    def root_state_messages(self):
+        """The external root-state messages (RootStateMessages) or None."""
+        return self._root_messages
+
+    def set_root_state_messages(self, messages):
+        """Set external root-state likelihood messages m_i(a) = P(D_ext,i | R_i = a).
+
+        ``messages``: ``{position: vector}`` (0-based full-alignment positions,
+        one value per GTR state), an (L, n_states) array with all-NaN rows
+        neutral, a :class:`~treetime.root_messages.RootStateMessages`, or None
+        to remove them. Unlisted positions are neutral.
+
+        The root's message from the rest of the world becomes pi_a m_i(a)
+        instead of pi_a, so the root posterior, the internal marginal profiles,
+        the branch profiles used by branch-length and date optimisation, and the
+        total likelihood all include the evidence, with the prior used once.
+
+        Identical alignment columns that receive different messages are split
+        into separate compressed patterns (the compression is refined, never
+        expanded). Changing the messages recompresses the alignment and drops
+        every per-node cached message and reconstructed sequence, so ancestral
+        inference has to be rerun before anything other than a likelihood
+        (``postorder_traversal_marginal`` + ``total_LH_and_root_sequence``) is
+        read. Not supported for sparse (VCF) input.
+        """
+        from .root_messages import RootStateMessages
+
+        if messages is not None:
+            messages = RootStateMessages(messages, self.gtr.n_states, length=self.data.full_length)
+            if messages.is_neutral:
+                messages = None
+        tags = None if messages is None else messages.tags(self.data.full_length)
+        old_tags = self.data.pattern_tags
+        same = (tags is None and old_tags is None) or (
+            tags is not None and old_tags is not None and np.array_equal(tags, old_tags)
+        )
+        self._root_messages = messages
+        if not same:
+            self.data.pattern_tags = tags
+            self.data.make_compressed_alignment()
+            self._reset_compressed_node_state()
+        self._root_msg_compressed = None if messages is None else messages.compressed(self.data)
+
+    def _reset_compressed_node_state(self):
+        """Drop every per-node quantity indexed by compressed pattern after the
+        compression changed."""
+        for n in self.tree.find_clades():
+            for attr in (
+                'marginal_subtree_LH',
+                'marginal_subtree_LH_prefactor',
+                'marginal_outgroup_LH',
+                'marginal_profile',
+                'marginal_log_Lx',
+                'branch_state',
+                'profile_pair',
+                'joint_Lx',
+                'joint_Cx',
+                'seq_idx',
+            ):
+                if hasattr(n, attr):
+                    delattr(n, attr)
+            if hasattr(n, '_cseq') and not (n.is_terminal() and n.name in self.data.compressed_alignment):
+                del n._cseq
+        self.sequence_reconstruction = False
+
+    def _root_message_for_patterns(self):
+        """(normalised messages L'xn, log scale L') for the current compression,
+        or None when there are no messages."""
+        if self._root_messages is None:
+            return None
+        if self._root_msg_compressed is None or self._root_msg_compressed[0].shape[0] != self.data.compressed_length:
+            self._root_msg_compressed = self._root_messages.compressed(self.data)
+        return self._root_msg_compressed
+
     def total_LH_and_root_sequence(self, sample_from_profile=False, assign_sequence=False):
         self.logger('Computing root node sequence and total tree likelihood...', 3)
         # Msg to the root from the distant part (equ frequencies)
@@ -818,11 +898,17 @@ class TreeAnc(object):
             self.tree.root.marginal_outgroup_LH = np.repeat([self.gtr.Pi], self.data.compressed_length, axis=0)
         else:
             self.tree.root.marginal_outgroup_LH = np.copy(self.gtr.Pi.T)
+        msg = self._root_message_for_patterns()
+        if msg is not None:
+            # external evidence on the root state: pi_a * m_i(a), prior used once
+            self.tree.root.marginal_outgroup_LH *= msg[0]
 
         self.tree.root.marginal_profile, pre = normalize_profile(
             self.tree.root.marginal_outgroup_LH * self.tree.root.marginal_subtree_LH
         )
         marginal_LH_prefactor = self.tree.root.marginal_subtree_LH_prefactor + pre
+        if msg is not None:
+            marginal_LH_prefactor = marginal_LH_prefactor + msg[1]
 
         self.tree.sequence_LH = marginal_LH_prefactor
         self.tree.total_sequence_LH = (self.tree.sequence_LH * self.data.multiplicity()).sum()
@@ -1016,6 +1102,10 @@ class TreeAnc(object):
         msg_from_children = np.sum(np.stack([c.joint_Lx for c in self.tree.root], axis=0), axis=0)
         # Pi(i) * Prod_ch Lch(i)
         self.tree.root.joint_Lx = msg_from_children + np.log(self.gtr.Pi).T
+        root_msg = self._root_message_for_patterns()
+        if root_msg is not None:
+            with np.errstate(divide='ignore'):
+                self.tree.root.joint_Lx = self.tree.root.joint_Lx + np.log(root_msg[0]) + root_msg[1][:, None]
         normalized_profile = (self.tree.root.joint_Lx.T - self.tree.root.joint_Lx.max(axis=1)).T
 
         # choose sequence characters from this profile.

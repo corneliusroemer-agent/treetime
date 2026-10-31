@@ -105,6 +105,7 @@ class SequenceData(object):
         self.likely_alphabet = None
         self.compressed_to_full_sequence_map = None
         self._multiplicity = None
+        self.pattern_tags = None  # optional int per full position; columns with different tags are never merged
         self.is_sparse = None
         self.convert_upper = convert_upper
         self.compress = compress
@@ -360,6 +361,8 @@ class SequenceData(object):
         # if alignment is sparse, don't iterate over all invarible sites.
         # so pre-load alignment_patterns with the location of const sites!
         # and get the sites that we want to iterate over only!
+        if self.is_sparse and self.pattern_tags is not None and np.any(self.pattern_tags):
+            raise NotImplementedError('SequenceData: pattern_tags are not supported for sparse (VCF) alignments')
         if self.is_sparse:
             from .vcf_utils import process_sparse_alignment
 
@@ -400,6 +403,10 @@ class SequenceData(object):
             # FIXME: this could be done more efficiently
             if len(unique_letters) > 1:
                 str_pattern += '_%d' % pi
+            elif self.pattern_tags is not None and self.pattern_tags[pi]:
+                # identical columns that carry different per-site side information
+                # (e.g. external root-state messages) stay separate patterns
+                str_pattern += '_t%d' % self.pattern_tags[pi]
 
             # if the pattern is not yet seen,
             if str_pattern not in alignment_patterns:
