@@ -37,8 +37,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .root_candidates import (candidate_key, format_source_ranks, outgroup_candidate_sources, rank_root_candidates,
-                              restore_best_fitted_state, fresh_marginal_score)
+from .root_candidates import (candidate_key, candidate_shortlist, format_source_ranks, outgroup_candidate_sources,
+                              rank_root_candidates, resolve_candidate_sources, restore_best_fitted_state,
+                              fresh_marginal_score)
 from .seq_utils import normalize_profile, seq2prof
 
 
@@ -239,6 +240,21 @@ def attachment_candidates(baseline, outgroups):
     return [r[3] for r in scan[og]], og, scan[og][0][2]
 
 
+def _check_stage1_candidates(baseline, stage1, explicit, regression_k, rank_kwargs):
+    """Raise unless a caller-supplied Stage 1 result has exactly the candidates 2b will fit."""
+    sources = resolve_candidate_sources(regression_k, rank_kwargs.get('candidate_sources'),
+                                        rank_kwargs.get('covariation'), rank_kwargs.get('tip_slack'))
+    want = set(candidate_shortlist(baseline, explicit=explicit, sources=sources,
+                                   ranked_sources=rank_kwargs.get('ranked_sources')))
+    have = {candidate_key(r.candidate) for r in stage1.results}
+    if want != have:
+        raise ValueError('rank_with_root_messages: the given stage1 result has a different candidate set from 2b '
+                         '(%d only in stage1, %d only in 2b); run Stage 1 with the same explicit, attachment and '
+                         'candidate-source arguments (attachment= becomes ranked_sources={"attach": ...} and, unless '
+                         'sources are named, outgroup_candidate_sources), or omit stage1'
+                         % (len(have - want), len(want - have)))
+
+
 def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, posterior_positions=(), stage1=None,
                             warm_start=True, attachment=(), attach_k=3, **rank_kwargs):
     """Stage 1, 2a and 2b on one candidate set.
@@ -253,8 +269,9 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
     ``regression_k``).
 
     1. Stage 1: :func:`rank_root_candidates` on the ingroup ``baseline`` (or the
-       given ``stage1`` result, which must have been run with the same
-       candidate arguments and must have kept its states).
+       given ``stage1`` result, which must have kept its states and must hold
+       exactly the candidates 2b will fit; a different candidate set raises
+       ``ValueError``).
     2. 2a: every Stage 1 candidate's best fitted state is scored post hoc with
        the messages (:func:`root_message_correction`).
     3. 2b: :func:`rank_root_candidates` on
@@ -283,8 +300,11 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
     if stage1 is None:
         stage1 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, keep_states=True,
                                       **rank_kwargs)
-    elif any(r.best_run is not None and r.best_run.error is None and r.best_run.state is None for r in stage1.results):
-        raise ValueError('rank_with_root_messages: the given stage1 result kept no states (keep_states=False)')
+    else:
+        if any(r.best_run is not None and r.best_run.error is None and r.best_run.state is None
+               for r in stage1.results):
+            raise ValueError('rank_with_root_messages: the given stage1 result kept no states (keep_states=False)')
+        _check_stage1_candidates(baseline, stage1, explicit, regression_k, rank_kwargs)
     rows_in = messages.values() if isinstance(messages, dict) else messages
     neutral = all(np.all(np.asarray(v, dtype=float) == 1.0) for v in rows_in)
     warm = {}

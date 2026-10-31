@@ -344,3 +344,26 @@ def test_attachment_candidates_and_attach_k(b20, fitted):
     labels = {n for r in res.stage1.results for n in r.source_ranks}
     assert labels == {'cov', 'attach'} and [s['name'] for s in res.stage1.config['candidate_sources']] == ['cov']
     assert res.stage2b.config['candidate_sources'] == res.stage1.config['candidate_sources']
+
+
+def test_given_stage1_must_match_2b_candidates(b20, fitted):
+    """A caller-supplied Stage 1 result whose candidate set differs from the one 2b
+    would fit (here: Stage 1 default plain+cov without the attachment placements)
+    is rejected before 2b runs; one run with the matching sources and
+    ranked_sources is accepted and every row gets a 2b score."""
+    from treetime.root_candidates import outgroup_candidate_sources, rank_root_candidates
+    b, true = b20
+    tt = fitted.state
+    near = ''.join(tt.tree.root._cseq[tt.data.full_to_compressed_sequence_map])
+    cands, og, d = attachment_candidates(b, {'near': near})
+    msg = outgroup_leaf_messages(b.gtr, near, d)
+    kw = dict(fit=FitConfig(0), sensitivity_window=None, rate_rounds=0)
+    s1 = rank_root_candidates(b, **kw)
+    with pytest.raises(ValueError, match='different candidate set'):
+        rank_with_root_messages(b, msg, stage1=s1, attachment=cands, warm_start=False, **kw)
+    s1 = rank_root_candidates(b, candidate_sources=outgroup_candidate_sources(5),
+                              ranked_sources={'attach': cands[:3]}, **kw)
+    res = rank_with_root_messages(b, msg, stage1=s1, attachment=cands, warm_start=False, **kw)
+    assert {candidate_key(r.candidate) for r in res.stage2b.results} == \
+        {candidate_key(r.candidate) for r in s1.results}
+    assert all(row['combined_2b'] is not None for row in res.rows)
