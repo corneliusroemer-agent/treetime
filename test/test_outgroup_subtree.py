@@ -380,3 +380,53 @@ def test_joint_tree_cmaple_roundtrip():
     t = joint_tree_cmaple(dict(seqs, **ogs), iqtree='iqtree3')
     o = OutgroupSubtree(b.gtr, ogs, tree=outgroup_tree_from_joint(t, list(ogs)))
     assert sorted(o.leaf_nodes) == sorted(ogs) and np.all(o.lengths > 0)
+
+
+# --- attachment mixture -------------------------------------------------------------
+def test_attachment_mixture(fx):
+    from scipy.special import logsumexp
+    from treetime.outgroup_subtree import _rooted_on_edge, _unrooted_from_state, attachment_mixture_scores
+    o = og3(fx)
+    tt = copy.deepcopy(fx['tt'])
+    sc, det = attachment_mixture_scores(fx['b'], tt, o, ws=(0.0, 0.2, 1.0), lengths=LENGTHS3, fit=False)
+    # w = 0 is the outgroup attached at the candidate root
+    assert abs(sc[0.0] - o.combined_score(copy.deepcopy(fx['tt']), LENGTHS3)) < TOL
+    adj, names, nb, root_edge = _unrooted_from_state(tt)
+    assert det['n_neighbours'] == len(nb) >= 2
+    # pulley: rerooting the state at its own root position reproduces the w = 0 term
+    if root_edge is not None:
+        u, v, f = root_edge
+        ta = fx['b'].make_treeanc(_rooted_on_edge(adj, names, u, v, f), messages=False)
+        assert abs(o.combined_score(ta, LENGTHS3) - sc[0.0]) < TOL
+    # a neighbour term equals an independent Felsenstein on the full tree with the outgroup at that edge's midpoint
+    a, b_ = nb[0]
+    t = _rooted_on_edge(adj, names, a, b_)
+    s, i12, l3, l1, l2 = LENGTHS3
+    t.root.clades.append(Clade(branch_length=s, clades=[
+        Clade(branch_length=i12, clades=[Clade(branch_length=l1, name='O1'), Clade(branch_length=l2, name='O2')]),
+        Clade(branch_length=l3, name='O3')]))
+    assert abs(brute(fx, t) - det['neighbours'][0]) < TOL
+    # the mixture itself, and its bounds
+    expect = logsumexp([np.log(0.8) + sc[0.0]] + [np.log(0.2 / len(nb)) + x for x in det['neighbours']])
+    assert abs(sc[0.2] - expect) < 1e-10
+    assert sc[1.0] <= max(det['neighbours']) + 1e-12
+    assert sc[0.2] >= np.log(0.2 / len(nb)) + max(det['neighbours']) - 1e-12
+    # with the lengths fitted every term can only improve
+    sc_fit, det_fit = attachment_mixture_scores(fx['b'], tt, o, ws=(0.0,), lengths=LENGTHS3)
+    assert sc_fit[0.0] >= sc[0.0] - 1e-9
+
+
+def test_mixture_in_driver_leaves_answer_unchanged():
+    nwk, aln, dates, _ = load('binary20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    ogs = _outgroups(seqs, len(next(iter(seqs.values()))))
+    kw = dict(regression_k=2, attach_k=1, fit=FitConfig(iterations=1), outer_iterations=1)
+    r0 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), **kw)
+    r1 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), mixture_ws=(0.0, 0.3), **kw)
+    assert [(r.candidate_id, r.score) for r in r1.stage3.results] == [(r.candidate_id, r.score) for r in r0.stage3.results]
+    for row in r1.rows:
+        assert row['mixture'][0.0] >= row['combined_3'] - 1e-9  # best state re-scored, lengths refitted
+        assert np.isfinite(row['mixture'][0.3])
+    rk = r1.mixture_ranking(0.3)
+    assert len(rk) == len(r1.rows) and rk[0][1] >= rk[-1][1]

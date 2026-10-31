@@ -19,6 +19,11 @@ outgroup subtree's root. Under a reversible stationary model the likelihood
 depends only on the unrooted tree (outgroup leaves + the attachment), and any
 input rooting naming the attachment explicitly maps to the same canonical form.
 
+Attachment mixture (:func:`attachment_mixture_scores`, post hoc): the
+outgroup joins at the candidate root with probability 1 - w and at one of the
+neighbouring edges with probability w, which bounds how far an outgroup that
+joins one edge off can override the clock.
+
 Compression: the messages depend on an alignment column only through its
 outgroup pattern, so they are computed once per distinct outgroup pattern and
 indexed back by position. Positions with equal outgroup patterns get
@@ -454,6 +459,13 @@ class Stage3Result:
                 'stage3_resolved': self.stage3.best_is_resolved,
                 'n_candidates': len(self.rows), 'n_extra': len(self.extra)}
 
+    def mixture_ranking(self, w):
+        """[(candidate_id, attachment-mixture score at weight w)], best first
+        (needs ``mixture_ws`` containing w)."""
+        w = float(w)
+        sc = [(r['candidate_id'], r['mixture'][w]) for r in self.rows if r['mixture'] and w in r['mixture']]
+        return sorted(sc, key=lambda t: -t[1])
+
     def to_tsv(self, path):
         rows = self.rows + self.extra
         cols = list(rows[0].keys()) if rows else []
@@ -474,7 +486,17 @@ def _warm_from(stage1):
     return warm
 
 
-def _rows(stage1, stage3, outgroup, is_extra=False):
+def _mixture(baseline, outgroup, states, ws, lengths):
+    """Per w, the best attachment-mixture score over the given fitted states."""
+    best = {}
+    for st in states:
+        sc, _ = attachment_mixture_scores(baseline, st, outgroup, ws=ws, lengths=lengths)
+        for w, v in sc.items():
+            best[w] = max(best.get(w, -np.inf), v)
+    return best
+
+
+def _rows(stage1, stage3, outgroup, is_extra=False, baseline=None, mixture_ws=()):
     from .root_candidates import candidate_key, format_source_ranks, fresh_marginal_score
     by3 = {candidate_key(r.candidate): r for r in stage3.results}
     rows = []
@@ -485,7 +507,7 @@ def _rows(stage1, stage3, outgroup, is_extra=False):
                'ingroup_1': r1.score, 'combined_3': None, 'ingroup_3': None, 'outgroup_3': None,
                'posthoc_3': None, 'outgroup_lengths': None, 'stem': None, 'outer_rounds': None, 'run_3': None,
                'root_date_1': r1.best_run.root.get('root_date') if r1.best_run else None, 'root_date_3': None,
-               'runtime_1': sum(x.runtime for x in r1.runs), 'runtime_3': None}
+               'runtime_1': sum(x.runtime for x in r1.runs), 'runtime_3': None, 'mixture': None}
         if r1.best_run is not None and r1.best_run.state is not None:
             # post hoc: Stage 1 state with the outgroup lengths fitted at it (no refit of the ingroup)
             row['posthoc_3'] = outgroup.fit_lengths(r1.best_run.state)[1]
@@ -500,13 +522,19 @@ def _rows(stage1, stage3, outgroup, is_extra=False):
                 fresh_marginal_score(st)
                 row.update(ingroup_3=float(st.tree.total_sequence_LH_ingroup),
                            outgroup_3=float(st.tree.total_root_message_LH))
+        if mixture_ws:
+            # post hoc at the Stage 1 and Stage 3 best states of this candidate; the better state counts per w
+            states = [r.best_run.state for r in (r1, r3) if r is not None and r.best_run is not None
+                      and r.best_run.error is None and r.best_run.state is not None]
+            x0 = row['outgroup_lengths']
+            row['mixture'] = _mixture(baseline, outgroup, states, mixture_ws, x0) if states else None
         rows.append(row)
     return rows
 
 
 def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, attachment='scan',
                                attach_k=3, extra_candidates=(), stage1=None, warm_start=True, outer_iterations=2,
-                               tol=1e-2, fit_lengths=True, **rank_kwargs):
+                               tol=1e-2, fit_lengths=True, mixture_ws=(), **rank_kwargs):
     """Stage 1 and Stage 3 (outgroup subtree, lengths fitted per candidate) on
     one candidate set.
 
@@ -530,6 +558,11 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
     ``Stage3Result.extra``, never in ``stage3.results``, and cannot change the
     selected root. An extra candidate already on the shortlist is reported with
     its shortlist fits.
+
+    ``mixture_ws``: attachment-mixture weights w scored post hoc
+    (:func:`attachment_mixture_scores`) at each candidate's Stage 1 and Stage 3
+    best states, the better per w; in ``rows[i]['mixture']`` and
+    :meth:`Stage3Result.mixture_ranking`. They do not change the Stage 3 answer.
     """
     from .root_candidates import (candidate_key, outgroup_candidate_sources, rank_root_candidates)
     keep = rank_kwargs.pop('keep_states', True)
@@ -558,7 +591,8 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
     if k1 != k3:
         raise ValueError('rank_with_outgroup_subtree: Stage 1 and Stage 3 candidate sets differ '
                          '(%d only in Stage 1, %d only in Stage 3)' % (len(k1 - k3), len(k3 - k1)))
-    rows = _rows(stage1, s3, outgroup)
+    mixture_ws = tuple(float(w) for w in mixture_ws)
+    rows = _rows(stage1, s3, outgroup, baseline=baseline, mixture_ws=mixture_ws)
     # extra candidates: same fits, outside the ranking
     extra_rows = []
     listed = {candidate_key(baseline.canonical(c)) for c in extra_candidates} & k1
@@ -573,14 +607,14 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
                                   **xkw)
         x3 = rank_root_candidates(baseline, explicit=new, regression_k=0, keep_states=True, candidate_sources=(),
                                   warm_starts=_warm_from(x1) if warm_start else None, evaluator=ev, **xkw)
-        extra_rows += _rows(x1, x3, outgroup, is_extra=True)
+        extra_rows += _rows(x1, x3, outgroup, is_extra=True, baseline=baseline, mixture_ws=mixture_ws)
     if not keep:
         for res in (stage1, s3):
             for r in res.results:
                 for x in r.runs:
                     x.state = None
     config = {'outer_iterations': outer_iterations, 'tol': tol, 'fit_lengths': fit_lengths,
-              'attach_k': attach_k, 'regression_k': regression_k, 'warm_start': warm_start,
+              'attach_k': attach_k, 'regression_k': regression_k, 'warm_start': warm_start, 'mixture_ws': mixture_ws,
               'outgroup_newick': outgroup.newick(), 'n_outgroup_patterns': outgroup.n_patterns}
     return Stage3Result(stage1, s3, rows, extra=extra_rows, scan=scan, config=config)
 
@@ -700,3 +734,80 @@ def joint_tree_cmaple(sequences, iqtree='iqtree3', model='GTR', seed=1):
         if p.returncode != 0:
             raise RuntimeError('joint_tree_cmaple: %s failed: %s' % (iqtree, p.stdout[-2000:]))
         return Phylo.read(os.path.join(td, 'j.treefile'), 'newick')
+
+
+# --------------------------------------------------------------------------
+# attachment mixture (post hoc): uncertainty about where the outgroup joins
+# --------------------------------------------------------------------------
+def _unrooted_from_state(tt):
+    """Adjacency {node index: {node index: length}} of a fitted ingroup state at
+    the lengths its likelihood uses; a bifurcating root is suppressed. Returns
+    (adj, names, neighbour edges of the root position, root edge or None)."""
+    nodes = list(tt.tree.find_clades(order='preorder'))
+    idx = {id(n): i for i, n in enumerate(nodes)}
+    adj = {i: {} for i in range(len(nodes))}
+    for n in nodes:
+        for c in n.clades:
+            t = float(tt._branch_length_to_gtr(c))
+            adj[idx[id(n)]][idx[id(c)]] = adj[idx[id(c)]][idx[id(n)]] = t
+    names = {idx[id(n)]: n.name for n in nodes if n.is_terminal()}
+    kids = list(adj[0])
+    if len(kids) == 2:  # root inside edge (u, v): neighbours are the other edges at u and at v
+        u, v = kids
+        tu, tv = adj[0][u], adj[0][v]
+        del adj[u][0], adj[v][0], adj[0]
+        adj[u][v] = adj[v][u] = tu + tv
+        nb = [(u, w) for w in adj[u] if w != v] + [(v, w) for w in adj[v] if w != u]
+        return adj, names, nb, (u, v, tu / (tu + tv) if tu + tv > 0 else 0.5)
+    return adj, names, [(0, w) for w in kids], None
+
+
+def _rooted_on_edge(adj, names, a, b, frac=0.5):
+    from Bio.Phylo.BaseTree import Clade, Tree
+
+    def build(v, p, bl):
+        return Clade(name=names.get(v), branch_length=bl,
+                     clades=[build(w, v, adj[v][w]) for w in sorted(adj[v]) if w != p])
+    t = adj[a][b]
+    root = Clade(branch_length=0.0, clades=[build(a, b, t * frac), build(b, a, t * (1 - frac))])
+    return Tree(root=root, rooted=True)
+
+
+def attachment_mixture_scores(baseline, tt, outgroup, ws=(0.0, 0.1, 0.3), lengths=None, fit=True):
+    """Attachment-mixture log-likelihoods of a fitted ingroup state ``tt`` rooted
+    at candidate R (post hoc: the ingroup state is not refitted).
+
+        L_w = (1 - w) L(outgroup at R) + w * mean_e L(outgroup at the midpoint of e)
+
+    over the edges e next to R: for R inside edge (u, v), every other edge at u
+    or v; for R at a node, its incident edges. Each term is the joint likelihood
+    of the ingroup at ``tt``'s branch lengths (rerooting a reversible tree leaves
+    it unchanged) and of the outgroup subtree attached there, with the outgroup
+    lengths fitted for that attachment (starting from ``lengths``, default
+    ``outgroup.lengths``; ``fit=False`` keeps those lengths for every term).
+    w = 0 is the post-hoc Stage 3 score of the state. The
+    mixture is a proper likelihood over attachment points, and it bounds the
+    penalty of a candidate whose own attachment the outgroup contradicts by
+    log(w / n_e) plus its best neighbour's term.
+
+    Returns ({w: log L_w}, {'at_root', 'neighbours', 'n_neighbours'})."""
+    from scipy.special import logsumexp
+    base = copy.deepcopy(tt)
+    base.set_root_state_messages(None)
+    x0 = outgroup.lengths if lengths is None else np.asarray(lengths, dtype=float)
+    th_r, s_r = outgroup.fit_lengths(base, x0=x0) if fit else (x0, outgroup.combined_score(base, x0))
+    adj, names, nb, _ = _unrooted_from_state(base)
+    s_nb = []
+    for a, b in nb:
+        ta = baseline.make_treeanc(_rooted_on_edge(adj, names, a, b), messages=False)
+        s_nb.append(outgroup.fit_lengths(ta, x0=th_r)[1] if fit else outgroup.combined_score(ta, th_r))
+    out = {}
+    for w in ws:
+        w = float(w)
+        if w == 0.0 or not s_nb:
+            out[w] = s_r
+        elif w == 1.0:
+            out[w] = float(logsumexp([np.log(1.0 / len(s_nb)) + s for s in s_nb]))
+        else:
+            out[w] = float(logsumexp([np.log1p(-w) + s_r] + [np.log(w / len(s_nb)) + s for s in s_nb]))
+    return out, {'at_root': s_r, 'neighbours': s_nb, 'n_neighbours': len(s_nb)}
