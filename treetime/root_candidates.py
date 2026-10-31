@@ -1172,7 +1172,11 @@ def resolve_candidate_sources(regression_k=5, candidate_sources=None, covariatio
 
 FINAL_RATE_EVALS = 15         # profile evaluations (dated fits at fixed rate) per final refit
 FINAL_RATE_XATOL = 0.01       # tolerance on log(rate): 1% in the rate
-FINAL_RATE_ITERATIONS = 2     # (ancestral inference, time tree) iterations per profile evaluation
+FINAL_RATE_ITERATIONS = 2     # (ancestral inference, time tree) iterations per block of a profile evaluation
+FINAL_RATE_MAX_ITERATIONS = 8  # cap per profile evaluation: blocks continue while a block gains >= the tolerance
+FINAL_RATE_POINT_TOL = 0.01    # logL gain below which a profile evaluation stops
+FAILED_POINT_PENALTY = 1e100   # finite stand-in for a failed evaluation, so Brent keeps bracketing
+FALLBACK_GRID = 9              # after a failed evaluation: log-rate grid over the clamp range, then Brent in its best cell
 
 
 def rescale_times_for_rate(state, mu0, mu):
@@ -1198,40 +1202,98 @@ def rescale_times_for_rate(state, mu0, mu):
 
 def fit_rate_profile(point, mu0, clamp=10.0, xatol=FINAL_RATE_XATOL, max_evals=FINAL_RATE_EVALS):
     """Maximise a profile likelihood over the clock rate, ``point(mu) ->
-    (logL, payload)``, over log(rate) in [mu0/clamp, mu0*clamp] by bounded Brent
-    (scipy ``minimize_scalar``, 'bounded'), at most ``max_evals`` evaluations,
-    tolerance ``xatol`` on log(rate). ``converged``: Brent met the tolerance
-    within the budget and the maximum is not within 1% of a bound. Returns a
-    dict with the best point (``mu``, ``logL``, ``payload``), every evaluated
-    ``(mu, logL)`` and the flags."""
+    (logL, payload)`` (``logL`` -inf or a payload with ``error`` set marks a
+    failed evaluation), over log(rate) in [mu0/clamp, mu0*clamp] by bounded
+    Brent (scipy ``minimize_scalar``, 'bounded'), at most ``max_evals``
+    evaluations, tolerance ``xatol`` on log(rate).
+
+    A failed evaluation is given a large finite penalty (an infinite one
+    makes Brent drift towards the bound and still report success) and is
+    listed in ``failures`` as ``(mu, error)``. Because the penalty is flat,
+    any failure triggers a fallback (``grid_fallback``): a ``FALLBACK_GRID``
+    point grid on log(rate) over the range, then Brent within the cells next
+    to the best grid point (each stage at most ``max_evals`` evaluations). ``converged``: Brent met the
+    tolerance within the budget, the maximum is not at a bound (within
+    max(1%, 2 xatol) in the rate) and no failed evaluation neighbours it.
+    With every evaluation failed, ``mu``/``logL``/``payload`` are None and
+    ``error`` says so. Returns a dict with the best point, every evaluated
+    ``(mu, logL)`` (failures as -inf) and the flags."""
     from scipy.optimize import minimize_scalar
     cache = {}
+
+    def ok(v):
+        return np.isfinite(v[0]) and getattr(v[1], 'error', None) is None
 
     def neg(x):
         x = float(x)
         if x not in cache:
             cache[x] = point(float(np.exp(x)))
-        return -cache[x][0]
+        return -cache[x][0] if ok(cache[x]) else FAILED_POINT_PENALTY
 
     lo, hi = np.log(mu0 / clamp), np.log(mu0 * clamp)
     res = minimize_scalar(neg, bounds=(lo, hi), method='bounded',
                           options={'xatol': xatol, 'maxiter': max_evals})
-    xb = max(cache, key=lambda x: cache[x][0])
-    at_bound = min(xb - lo, hi - xb) < np.log(1.01)
-    return {'mu': float(np.exp(xb)), 'logL': cache[xb][0], 'payload': cache[xb][1],
-            'points': sorted((float(np.exp(x)), v[0]) for x, v in cache.items()),
-            'n_evals': len(cache), 'brent_converged': bool(res.success), 'at_bound': bool(at_bound),
-            'converged': bool(res.success and not at_bound)}
+    fallback = False
+    if any(not ok(v) for v in cache.values()):
+        # failures make the penalised objective flat there: scan a grid, then Brent inside the best grid cell
+        fallback = True
+        grid = np.linspace(lo, hi, FALLBACK_GRID)
+        for x in grid:
+            neg(x)
+        good = [x for x in grid if ok(cache[float(x)])]
+        if good:
+            k = int(np.searchsorted(grid, max(good, key=lambda x: cache[float(x)][0])))
+            a, c = grid[max(k - 1, 0)], grid[min(k + 1, len(grid) - 1)]
+            res = minimize_scalar(neg, bounds=(a, c), method='bounded', options={'xatol': xatol, 'maxiter': max_evals})
+    xs = sorted(cache)
+    failures = [(float(np.exp(x)), getattr(cache[x][1], 'error', None) or 'logL not finite')
+                for x in xs if not ok(cache[x])]
+    points = [(float(np.exp(x)), cache[x][0] if ok(cache[x]) else -np.inf) for x in xs]
+    good = [x for x in xs if ok(cache[x])]
+    out = {'points': points, 'n_evals': len(cache), 'brent_converged': bool(res.success), 'failures': failures,
+           'grid_fallback': fallback}
+    if not good:
+        out.update(mu=None, logL=None, payload=None, at_bound=None, converged=False,
+                   error='all %d profile evaluations failed: %s' % (len(xs), failures[0][1] if failures else '?'))
+        return out
+    xb = max(good, key=lambda x: cache[x][0])
+    at_bound = min(xb - lo, hi - xb) < max(np.log(1.01), 2 * xatol)
+    k = xs.index(xb)
+    failed_next = any(0 <= n < len(xs) and not ok(cache[xs[n]]) for n in (k - 1, k + 1))
+    out.update(mu=float(np.exp(xb)), logL=cache[xb][0], payload=cache[xb][1], at_bound=bool(at_bound),
+               converged=bool(res.success and not at_bound and not failed_next), error=None,
+               failure_next_to_best=bool(failed_next))
+    return out
 
 
-def profile_rate_point(evaluate, cand, state, mu0, mu, iterations=FINAL_RATE_ITERATIONS):
+def profile_rate_point(evaluate, cand, state, mu0, mu, iterations=FINAL_RATE_ITERATIONS,
+                       max_iterations=FINAL_RATE_MAX_ITERATIONS, tol=FINAL_RATE_POINT_TOL):
     """One point of the profile likelihood over the clock rate: the dated fit of
     candidate ``cand`` at fixed rate ``mu`` (``evaluate(cand, mode, rounds,
     warm=(state, mu), iterations=)``, i.e. the ranking's evaluator, so Stage 2
     messages and Stage 3 outgroup subtrees are included), warm-started from
     :func:`rescale_times_for_rate` (``state`` at rate ``mu0``, moved to ``mu``).
-    Returns ``(logL, FitRun)``."""
+    The fit runs in blocks of ``iterations``, each warm from the previous
+    block's best state, while a block gains at least ``tol`` and up to
+    ``max_iterations`` in all: two iterations alone underfit well above the
+    profile maximum, where the rescaled start is far from the fixed point.
+    Returns ``(logL, FitRun)``; the FitRun's ``extra`` gains
+    ``profile_iterations`` and ``profile_last_gain``. A failed fit gives -inf
+    and the run with ``error`` set."""
     run = evaluate(cand, None, 0, warm=(rescale_times_for_rate(state, mu0, mu), float(mu)), iterations=iterations)
+    done, gain = iterations, None
+    while run.error is None and done + iterations <= max_iterations:
+        nxt = evaluate(cand, None, 0, warm=(run.state, float(mu)), iterations=iterations)
+        done += iterations
+        if nxt.error is not None:
+            break
+        gain = nxt.best_score - run.best_score
+        if gain > 0:
+            run = nxt
+        if gain < tol:
+            break
+    if run.error is None:
+        run.extra = dict(run.extra or {}, profile_iterations=done, profile_last_gain=gain)
     return (run.best_score if run.error is None else -np.inf), run
 
 
@@ -1254,18 +1316,34 @@ def _final_rate_refit_one(r, evaluate, clamp, xatol, max_evals, iterations, catc
            'ranking_logL': r.score, 'ranking_clock_rate': b.clock_rate, 'ranking_rate_fitted': b.rate_fitted,
            'error': None, 'warnings': [], 'state': None, 'refit_logL': None, 'refit_root_date': None,
            'refit_clock_rate': None, 'n_evals': 0, 'converged': None, 'at_bound': None, 'profile_points': [],
-           'refit_is_ranking_state': None, 'refit_extra': {}}
+           'refit_is_ranking_state': None, 'refit_extra': {}, 'profile_failures': []}
     if b.state is None:
         raise ValueError('final rate refit: the winner kept no state')
     t0 = time.time()
+    f = None
+
+    def point(mu):
+        try:
+            return profile_rate_point(evaluate, b.candidate, b.state, b.clock_rate, mu, iterations)
+        except FIT_ERRORS as exc:
+            if not catch_errors:
+                raise
+            return -np.inf, FitRun(candidate=b.candidate, candidate_id=r.candidate_id, initial_fraction=None,
+                                   initial_mode='warm',
+                                   error='%s: %s' % (type(exc).__name__, exc))
     try:
-        f = fit_rate_profile(lambda mu: profile_rate_point(evaluate, b.candidate, b.state, b.clock_rate, mu, iterations),
-                             b.clock_rate, clamp=clamp, xatol=xatol, max_evals=max_evals)
+        f = fit_rate_profile(point, b.clock_rate, clamp=clamp, xatol=xatol, max_evals=max_evals)
     except FIT_ERRORS as exc:
         if not catch_errors:
             raise
-        rec['error'] = '%s: %s' % (type(exc).__name__, exc)
+        rec.update(error='%s: %s' % (type(exc).__name__, exc), converged=False)
     else:
+        rec.update(n_evals=f['n_evals'], profile_points=f['points'], profile_failures=f['failures'])
+        if f['failures']:
+            rec['warnings'].append('%d of %d profile evaluations failed' % (len(f['failures']), f['n_evals']))
+    if f is not None and f['error'] is not None:
+        rec.update(error=f['error'], converged=False)
+    elif f is not None:
         keep_ranking = r.score >= f['logL']
         best = b if keep_ranking else f['payload']
         st = best.state
@@ -1277,6 +1355,8 @@ def _final_rate_refit_one(r, evaluate, clamp, xatol, max_evals, iterations, catc
                     'refit_extra': dict(best.extra) if getattr(best, 'extra', None) else {}})
         if f['at_bound']:
             rec['warnings'].append('rate at bound')
+        elif f.get('failure_next_to_best'):
+            rec['warnings'].append('failed profile evaluation next to the best rate')
         elif not f['converged']:
             rec['warnings'].append('rate refit not converged')
     rec['runtime'] = time.time() - t0

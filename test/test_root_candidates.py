@@ -774,3 +774,60 @@ def test_duplicate_merge_never_changes_the_winner(fx):
     for r in res.results:
         if r.duplicate_of:
             assert rep[r.duplicate_of].root_id == r.root_id and rep[r.duplicate_of].score >= r.score
+
+
+def test_rate_profile_failed_evaluations_surface():
+    """A failed profile evaluation is a finite penalty for Brent, never a silent success: with failures above
+    0.5 mu0 the search still finds a maximum below them; with every evaluation failing, the result says so."""
+    from types import SimpleNamespace
+    mu0, peak = 1.0, 0.3
+
+    def point(mu):  # concave in log(rate), maximum at `peak`; evaluations above 0.5 fail
+        if mu > 0.5:
+            return -np.inf, SimpleNamespace(error='ZeroDivisionError: boom')
+        return -10 * np.log(mu / peak) ** 2, SimpleNamespace(error=None)
+
+    f = fit_rate_profile(point, mu0)
+    assert f['error'] is None and abs(np.log(f['mu'] / peak)) < 0.05
+    assert f['failures'] and all(mu > 0.5 for mu, _ in f['failures'])
+    assert all(v == -np.inf for mu, v in f['points'] if mu > 0.5)
+    g = fit_rate_profile(lambda mu: (-np.inf, SimpleNamespace(error='ValueError: nope')), mu0)
+    assert g['converged'] is False and g['mu'] is None and g['payload'] is None
+    assert g['error'].startswith('all ') and 'nope' in g['error'] and len(g['failures']) == g['n_evals']
+
+
+def test_final_rate_refit_reports_all_failed_evaluations(refit_pair):
+    """Inside rank_root_candidates: an evaluator whose fixed-rate fits all fail gives converged False, the error,
+    no refit values, and the ranking untouched."""
+    b, off, _ = refit_pair
+    kw = dict(regression_k=2, fit=FIT1, candidate_sources=plain_candidate_sources(2))
+
+    def ev(baseline, cand, fit=None, keep_state=True, catch_errors=False, clock_rate=None, initial_state=None):
+        if initial_state is not None and fit is not None and fit.iterations == 2:
+            raise ZeroDivisionError('forced failure')  # only the profile evaluations (2 iterations, warm)
+        return evaluate_root_candidate(baseline, cand, fit, keep_state=keep_state, catch_errors=catch_errors,
+                                       clock_rate=clock_rate, initial_state=initial_state)
+    res = rank_root_candidates(b, final_rate_refit=True, catch_errors=True, evaluator=ev, **kw)
+    ref = res.final_rate_refit
+    assert ref['converged'] is False and ref['error'] and 'forced failure' in ref['error']
+    assert ref['refit_logL'] is None and ref['refit_clock_rate'] is None and ref['state'] is None
+    assert ref['n_evals'] >= 1 and len(ref['profile_failures']) == ref['n_evals']
+    assert _rows_without_runtime(res) == _rows_without_runtime(off)
+    assert res.summary()['final_rate_refit']['converged'] is False
+
+
+def test_profile_point_iterates_until_converged(refit_pair):
+    """Above the profile maximum two iterations underfit; the point keeps iterating in blocks until a block
+    gains < 0.01 logL (cap 8) and records how far it went."""
+    b, off, _ = refit_pair
+    win, mu0 = off.best.best_run, b.clock_rate
+
+    def ev(c, mode, rounds, warm=None, iterations=None):
+        return evaluate_root_candidate(b, c, FitConfig(iterations, rate_rounds=rounds), clock_rate=warm[1],
+                                       initial_state=warm[0])
+    for m in (0.5, 3.0):
+        v, run = profile_rate_point(ev, win.candidate, win.state, mu0, mu0 * m)
+        two, _ = profile_rate_point(ev, win.candidate, win.state, mu0, mu0 * m, max_iterations=2)
+        it, gain = run.extra['profile_iterations'], run.extra['profile_last_gain']
+        assert 2 <= it <= 8 and v >= two - 1e-9
+        assert it == 8 or gain is None or gain < 0.01
