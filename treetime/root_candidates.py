@@ -135,9 +135,10 @@ class UnrootedBaseline:
         self.gtr = gtr if isinstance(gtr, GTR) else GTR.standard(gtr)
         self.rng_seed = rng_seed
         self.tt_kwargs = dict(tt_kwargs or {})
+        self.root_state_messages = None  # external root-state likelihoods, see with_root_state_messages
         self._from_phylo(tree)
         if optimize_baseline:
-            tt = self.make_treetime(self.rooted_phylo(None))
+            tt = self.make_treetime(self.rooted_phylo(None), messages=False)
             tt.optimize_tree(infer_gtr=False, max_iter=1, method_anc='probabilistic', **_seq_kwargs())
             self._from_phylo(tt.tree, keep_names=True)
         if clock_rate is None:
@@ -291,17 +292,31 @@ class UnrootedBaseline:
             root.clades = [build(a, b, w * cand.fraction), build(b, a, w * (1.0 - cand.fraction))]
         return Tree(root=root, rooted=True)
 
-    def make_treetime(self, tree):
-        """New TreeTime object on ``tree``: same alignment, dates, model and seed."""
+    def make_treetime(self, tree, messages=True):
+        """New TreeTime object on ``tree``: same alignment, dates, model and seed,
+        carrying the baseline's root-state messages unless ``messages=False``."""
         kw = dict(verbose=0, branch_length_mode='marginal', use_covariation=False)
         kw.update(self.tt_kwargs)
-        return TreeTime(tree=tree, aln=self.aln, dates=self.dates, gtr=copy.deepcopy(self.gtr),
-                        rng_seed=self.rng_seed, **kw)
+        tt = TreeTime(tree=tree, aln=self.aln, dates=self.dates, gtr=copy.deepcopy(self.gtr),
+                      rng_seed=self.rng_seed, **kw)
+        if messages and self.root_state_messages is not None:
+            tt.set_root_state_messages(self.root_state_messages)
+        return tt
+
+    def with_root_state_messages(self, messages):
+        """Copy of this baseline (same topology, branch lengths, model and clock
+        rate) whose candidate fits carry external root-state likelihoods
+        (:meth:`TreeAnc.set_root_state_messages`; ``None`` removes them). The
+        baseline branch lengths and the regression do not depend on the rooting
+        and stay the ingroup ones."""
+        other = copy.copy(self)
+        other.root_state_messages = messages
+        return other
 
     def regression(self, covariation=False, tip_slack=None):
         """TreeRegression on the baseline branch lengths. ``tip_slack`` sets the
         extra tip variance of the covariation model (TreeTime's default if None)."""
-        tt = self.make_treetime(self.rooted_phylo(None))
+        tt = self.make_treetime(self.rooted_phylo(None), messages=False)
         if tip_slack is not None:
             tt.tip_slack = tip_slack
         treg = tt.setup_TreeRegression(covariation=covariation)
@@ -462,7 +477,8 @@ def _rescale_rate(tt, mu):
             n.branch_length = mu * (n.numdate - n.up.numdate)
 
 
-def evaluate_root_candidate(baseline, cand, fit=None, keep_state=True, catch_errors=False, clock_rate=None):
+def evaluate_root_candidate(baseline, cand, fit=None, keep_state=True, catch_errors=False, clock_rate=None,
+                            initial_state=None):
     """Fit one candidate from a clean baseline; returns a :class:`FitRun`.
 
     The steps mirror ``TreeTime.run(root=None)`` on the pre-rooted tree in the
@@ -493,36 +509,49 @@ def evaluate_root_candidate(baseline, cand, fit=None, keep_state=True, catch_err
     (``FitRun.clock_rates``, ``FitRun.clock_rate`` for the best step). A rate
     within 1% of the clamp is reported as a warning.
 
+    ``initial_state`` (a fitted TreeTime of this candidate, e.g. a retained
+    best state) starts the trajectory from that state instead of the baseline
+    (``initial_mode`` 'warm'): it is deep-copied, given the baseline's root-state
+    messages, scored at its own branch lengths (step 0), then iterated as above.
+    Pass its clock rate as ``clock_rate``.
+
     Errors propagate unless ``catch_errors`` is set; a failed fit then has
     score -inf and the error in ``error``.
     """
     fit = fit or FitConfig()
     cand = baseline.canonical(cand)
     run = FitRun(candidate=cand, candidate_id=baseline.candidate_id(cand),
-                 initial_fraction=getattr(cand, 'fraction', None), initial_mode=fit.initial_mode,
+                 initial_fraction=None if initial_state is not None else getattr(cand, 'fraction', None),
+                 initial_mode='warm' if initial_state is not None else fit.initial_mode,
                  rate_fitted=fit.rate_rounds > 0)
     t0 = time.time()
     try:
-        tt = baseline.make_treetime(baseline.rooted_phylo(cand))
-        kids = tt.tree.root.clades
-        if len(kids) == 2 and kids[0].branch_length + kids[1].branch_length < ttconf.MIN_BRANCH_LENGTH * tt.one_mutation:
-            for c in kids:
-                c.branch_length = c.mutation_length = 0.5 * tt.one_mutation
-            run.warnings.append('zero-length root edge: initial length set to one mutation')
-        tt._set_branch_length_mode('marginal')
         seq_kwargs = _seq_kwargs()
         mu = float(clock_rate if clock_rate is not None else baseline.clock_rate)
         if not mu > 0:
             raise ValueError('clock_rate must be positive')
-        tt.optimize_tree(infer_gtr=False, max_iter=1, method_anc='probabilistic', **_seq_kwargs(fit.initial_mode))
-        tt.optimize_tree(max_iter=1, method_anc='probabilistic', **seq_kwargs)
-        tt.make_time_tree(clock_rate=mu, time_marginal=False)
+        if initial_state is not None:
+            tt = copy.deepcopy(initial_state)
+            if baseline.root_state_messages is not None or tt.root_state_message is not None:
+                tt.set_root_state_messages(baseline.root_state_messages)
+        else:
+            tt = baseline.make_treetime(baseline.rooted_phylo(cand))
+            kids = tt.tree.root.clades
+            if len(kids) == 2 and kids[0].branch_length + kids[1].branch_length < ttconf.MIN_BRANCH_LENGTH * tt.one_mutation:
+                for c in kids:
+                    c.branch_length = c.mutation_length = 0.5 * tt.one_mutation
+                run.warnings.append('zero-length root edge: initial length set to one mutation')
+            tt._set_branch_length_mode('marginal')
+            tt.optimize_tree(infer_gtr=False, max_iter=1, method_anc='probabilistic', **_seq_kwargs(fit.initial_mode))
+            tt.optimize_tree(max_iter=1, method_anc='probabilistic', **seq_kwargs)
+            tt.make_time_tree(clock_rate=mu, time_marginal=False)
         _record(baseline, run, tt, mu, None, None, keep_state)
 
         def iterate():
-            prev_root = np.array(tt.tree.root._cseq, copy=True)
+            # no root sequence yet on a warm start (its messages reset the reconstruction)
+            prev_root = np.array(tt.tree.root._cseq, copy=True) if hasattr(tt.tree.root, '_cseq') else None
             ndiff = tt.infer_ancestral_sequences('ml', marginal=True, **seq_kwargs)
-            root_changes = int(np.sum(prev_root != tt.tree.root._cseq))
+            root_changes = None if prev_root is None else int(np.sum(prev_root != tt.tree.root._cseq))
             tt.make_time_tree(clock_rate=mu, time_marginal=False)
             run.iterations_performed += 1
             if ndiff == 0 and run.treetime_stop_iteration is None:
@@ -834,7 +863,7 @@ def _alternatives(cand, tried_fractions, fractions):
 def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=None,
                          sensitivity_fractions=(0.1, 0.5, 0.9), min_margin=1.0, covariation=False,
                          tip_slack=None, keep_states=True, catch_errors=False, rate_rounds=0, rate_fit_window=5.0,
-                         rate_fit_min=3, rate_fit_max=15, rate_fit_extra=()):
+                         rate_fit_min=3, rate_fit_max=15, rate_fit_extra=(), warm_starts=None):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
@@ -877,6 +906,12 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     (``rate_fitted`` column). Their sensitivity re-fits use the same rate setting.
     ``rate_rounds=0`` uses the shared rate throughout.
 
+    ``warm_starts``: ``{candidate_key: (TreeTime, clock_rate)}``; each listed
+    candidate gets one more trajectory started from that fitted state
+    (``initial_mode`` 'warm', see :func:`evaluate_root_candidate`), so its score
+    is at least that state's score under this baseline. Stage 2b uses it to
+    continue from the Stage 1 best state.
+
     ``keep_states=False`` keeps no TreeTime copies; otherwise only the best run
     of each candidate keeps its copy.
     """
@@ -901,10 +936,16 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
                                              tip_slack=tip_slack):
             add(c, 'regression', info)
 
-    def evaluate(c, mode, rounds=0):
+    warm_starts = warm_starts or {}
+
+    def evaluate(c, mode, rounds=0, warm=None):
+        if mode == 'warm':  # a warm run's rate fit restarts from the same state
+            warm, mode = warm_starts[candidate_key(baseline.canonical(c))], fit.initial_mode
         cfg = FitConfig(fit.iterations, mode, rate_rounds=rounds, rate_span=fit.rate_span, rate_clamp=fit.rate_clamp,
                         rate_xatol=fit.rate_xatol)
-        return evaluate_root_candidate(baseline, c, cfg, keep_state=keep_states, catch_errors=catch_errors)
+        state, mu = warm if warm is not None else (None, None)
+        return evaluate_root_candidate(baseline, c, cfg, keep_state=keep_states, catch_errors=catch_errors,
+                                       clock_rate=mu, initial_state=state)
 
     results = []
     for key, d in merged.items():
@@ -914,6 +955,8 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
                               regression_chisq=d['info'].get('regression_chisq'))
         for c in dict.fromkeys(d['inits']):
             res.runs.append(evaluate(c, fit.initial_mode))
+        if key in warm_starts:
+            res.runs.append(evaluate(cand, fit.initial_mode, warm=warm_starts[key]))
         results.append(res)
 
     results.sort(key=lambda r: -r.score)
@@ -957,7 +1000,7 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         'sensitivity_window': sensitivity_window, 'sensitivity_fractions': list(sensitivity_fractions),
         'min_margin': min_margin, 'rate_rounds': rate_rounds, 'rate_fit_window': rate_fit_window,
         'rate_fit_min': rate_fit_min, 'rate_fit_max': rate_fit_max, 'rate_span': fit.rate_span,
-        'rate_clamp': fit.rate_clamp,
+        'rate_clamp': fit.rate_clamp, 'warm_starts': len(warm_starts),
     }
     return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config)
 
