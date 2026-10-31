@@ -209,3 +209,68 @@ def test_invalid_messages_rejected():
         RootStateMessages({0: [1, -1, 1, 1, 1]}, 5)
     with pytest.raises(ValueError):
         RootStateMessages({700: np.ones(5) * 2}, 5, length=600)
+
+
+def _bruteforce_loglik(gtr, tree, leaf_seqs, bl, out, d):
+    """Plain numpy/scipy Felsenstein pruning on uncompressed columns, with an
+    outgroup leaf attached at the root. Rate matrix is built here from W, Pi, mu;
+    TreeTime's convention is Q[a, b] = mu * W[a, b] * Pi[a] (rate b -> a), diagonal
+    set so columns sum to zero, so P(t)[a, b] = P(child a | parent b)."""
+    from scipy.linalg import expm
+    W, pi = np.asarray(gtr.W, float), np.asarray(gtr.Pi, float)
+    Q = gtr.mu * W * pi[:, None]
+    np.fill_diagonal(Q, 0.0)
+    np.fill_diagonal(Q, -Q.sum(axis=0))
+    alpha = list(gtr.alphabet)
+    n = len(alpha)
+
+    def P(t):
+        return expm(Q * t)
+
+    # one-time convention check against TreeTime's own transition matrix
+    assert np.allclose(P(0.07), gtr.expQt(0.07), atol=1e-9)
+
+    def profile(seq):
+        prof = np.ones((len(seq), n))
+        for i, ch in enumerate(seq.upper()):
+            if ch in alpha:
+                prof[i] = 0.0
+                prof[i, alpha.index(ch)] = 1.0
+        return prof  # unknown characters ('N', '?', ...) stay all ones
+
+    L = len(next(iter(leaf_seqs.values())))
+    prof = {k: profile(v) for k, v in leaf_seqs.items()}
+    Ps = {}
+
+    def prune(node):
+        if node.is_terminal():
+            return prof[node.name]
+        lik = np.ones((L, n))
+        for ch in node.clades:
+            t = bl[ch.name]
+            Pt = Ps.setdefault(t, P(t))
+            lik = lik * (prune(ch) @ Pt.T)  # sum_b P[b, a] * l_child(b)
+        return lik
+
+    root = prune(tree.root)
+    root = root * (profile(out) @ P(d).T)
+    return float(np.log(root @ pi).sum())
+
+
+def test_combined_score_equals_bruteforce_felsenstein(fitted):
+    """Independent check: uncompressed plain pruning (scipy expm, one-hot leaves,
+    root prior Pi) equals the root-message score, including an ambiguous outgroup character."""
+    b, aln, run = fitted
+    tt0 = run.state
+    out = list(outgroup_seq(aln))
+    out[3], out[250], out[251] = 'N', 'N', 'N'
+    out = ''.join(out)
+    d = 0.02
+    t = Phylo.read(io.StringIO(fitted_newick(tt0)), 'newick')
+    bl = {n.name: tt0._branch_length_to_gtr(n) for n in tt0.tree.find_clades() if n.up is not None}
+    ref = _bruteforce_loglik(b.gtr, t, aln, bl, out, d)
+    tt = copy.deepcopy(run.state)
+    tt.set_root_state_messages(outgroup_messages(b.gtr, out, d))
+    got = fresh_marginal_score(tt)
+    print('bruteforce', ref, 'treetime', got, 'diff', got - ref)
+    assert got == pytest.approx(ref, abs=1e-8)
