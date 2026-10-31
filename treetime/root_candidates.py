@@ -668,6 +668,101 @@ def regression_candidates(baseline, k=5, covariation=False, tip_slack=None, slop
     return out
 
 
+@dataclass(frozen=True)
+class RegressionSource:
+    """One regression shortlist: the best ``k`` placements of
+    :func:`regression_candidates` with these arguments, labelled ``name``
+    (``k=None``: every placement)."""
+
+    name: str
+    k: Optional[int] = 5
+    covariation: bool = False
+    tip_slack: Optional[float] = None
+    slope: object = 'fixed'
+
+    def candidates(self, baseline):
+        return regression_candidates(baseline, k=self.k, covariation=self.covariation, tip_slack=self.tip_slack,
+                                     slope=self.slope)
+
+
+def default_candidate_sources(k=5):
+    """The default shortlist: plain root-to-tip regression at the baseline's
+    fixed rate, top ``k``, and covariation regression (tip_slack 3, free slope),
+    top ``k``. On simulated benchmarks the true root was often off the plain
+    list alone and on the covariation list (investigation report 35)."""
+    return (RegressionSource('plain', k),
+            RegressionSource('cov', k, covariation=True, tip_slack=3.0, slope=None))
+
+
+def plain_candidate_sources(k=5):
+    """The shortlist before the covariation source was added: plain regression
+    at the baseline's fixed rate, top ``k``."""
+    return (RegressionSource('plain', k),)
+
+
+@dataclass
+class ShortlistEntry:
+    """One distinct candidate (node, or edge regardless of fraction) of a shortlist."""
+
+    inits: list  # distinct initialisations, the first regression source's placement first
+    source_ranks: dict  # {source name: rank within that source (1 = best)}, in the order the sources proposed it
+    regression_info: dict  # {regression source name: rank, chisq and split from regression_candidates}
+
+    @property
+    def candidate(self):
+        return self.inits[0]
+
+    @property
+    def source(self):
+        return '+'.join(self.source_ranks)
+
+
+def candidate_shortlist(baseline, explicit=(), sources=None, ranked_sources=None):
+    """Merge candidates from several sources into distinct candidates, keyed by
+    :func:`candidate_key` (bipartition identity), in first-proposed order.
+
+    Sources are applied in this order: ``explicit`` (label 'explicit', rank =
+    list position), ``ranked_sources`` (``{name: [candidate, ...]}``, best
+    first, e.g. outgroup-attachment placements), then the regression
+    ``sources`` (:class:`RegressionSource`; ``None`` = none). Explicit and ranked
+    placements each add an initialisation; of the regression sources, only the
+    first one to propose a candidate adds its placement, as the first
+    initialisation, so a candidate on several regression lists is fitted once.
+    Returns ``{candidate_key: ShortlistEntry}``.
+    """
+    merged = {}
+
+    def entry(c):
+        return merged.setdefault(candidate_key(c), ShortlistEntry(inits=[], source_ranks={}, regression_info={}))
+
+    def add_listed(name, cands):
+        for i, c in enumerate(cands):
+            c = baseline.canonical(c)
+            e = entry(c)
+            e.source_ranks.setdefault(name, i + 1)
+            if c not in e.inits:
+                e.inits.append(c)
+
+    add_listed('explicit', explicit)
+    for name, cands in (ranked_sources or {}).items():
+        if name == 'explicit' or any(name == s.name for s in sources or ()):
+            raise ValueError('candidate source name %r is used twice' % name)
+        add_listed(name, cands)
+    names = [s.name for s in sources or ()]
+    if len(set(names)) != len(names):
+        raise ValueError('regression source names must be distinct: %s' % names)
+    for src in sources or ():
+        for c, info in src.candidates(baseline):
+            e = entry(c)
+            if not e.regression_info:
+                if c in e.inits:
+                    e.inits.remove(c)
+                e.inits.insert(0, c)
+            e.source_ranks.setdefault(src.name, info['regression_rank'])
+            e.regression_info[src.name] = info
+    return merged
+
+
 # --------------------------------------------------------------------------
 # orchestration
 # --------------------------------------------------------------------------
@@ -680,6 +775,7 @@ class CandidateResult:
     source: str
     regression_rank: Optional[int] = None
     regression_chisq: Optional[float] = None
+    source_ranks: dict = field(default_factory=dict)  # {source name: rank within that source}
     runs: list = field(default_factory=list)
     delta_logL: Optional[float] = None
     resolved_from_best: Optional[bool] = None
@@ -719,6 +815,7 @@ class CandidateResult:
             'split': sorted(self.candidate.split),
             'kind': self.candidate.kind,
             'source': self.source,
+            'source_ranks': format_source_ranks(self.source_ranks),
             'regression_rank': self.regression_rank,
             'regression_chisq': self.regression_chisq,
             'logL': self.score if ok else None,
@@ -750,7 +847,12 @@ class CandidateResult:
         }
 
 
-TSV_COLS = ['candidate_id', 'stable_id', 'kind', 'source', 'regression_rank', 'regression_chisq', 'logL', 'delta_logL',
+def format_source_ranks(ranks):
+    """``{'plain': 1, 'cov': 3}`` -> ``'plain:1,cov:3'``."""
+    return ','.join('%s:%d' % (k, v) for k, v in ranks.items())
+
+
+TSV_COLS = ['candidate_id', 'stable_id', 'kind', 'source', 'source_ranks', 'regression_rank', 'regression_chisq', 'logL', 'delta_logL',
             'positional_LH', 'cached_LH', 'clock_rate', 'rate_fitted', 'initial_fraction', 'initial_mode', 'fitted_fraction',
             'root_date', 'root_degree', 'root_child_lengths', 'iterations_performed', 'best_iteration',
             'treetime_stop_iteration', 'trajectory_class', 'tail_fluctuation', 'n_initialisations',
@@ -875,18 +977,53 @@ def _alternatives(cand, tried_fractions, fractions):
     return alts
 
 
+def resolve_candidate_sources(regression_k=5, candidate_sources=None, covariation=None, tip_slack=None):
+    """The regression sources :func:`rank_root_candidates` uses (see there)."""
+    if covariation is not None or tip_slack is not None:
+        if candidate_sources is not None:
+            raise ValueError('pass either candidate_sources or covariation/tip_slack, not both')
+        if not regression_k:
+            return ()
+        name = 'cov_fixed_slope' if covariation else 'plain'
+        return (RegressionSource(name, regression_k, covariation=bool(covariation), tip_slack=tip_slack),)
+    if candidate_sources is not None:
+        return tuple(candidate_sources)
+    return default_candidate_sources(regression_k) if regression_k else ()
+
+
 def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=None,
-                         sensitivity_fractions=(0.1, 0.5, 0.9), min_margin=1.0, covariation=False,
+                         sensitivity_fractions=(0.1, 0.5, 0.9), min_margin=1.0, covariation=None,
                          tip_slack=None, keep_states=True, catch_errors=False, rate_rounds=0, rate_fit_window=5.0,
-                         rate_fit_min=3, rate_fit_max=15, rate_fit_extra=(), warm_starts=None):
+                         rate_fit_min=3, rate_fit_max=15, rate_fit_extra=(), warm_starts=None,
+                         candidate_sources=None, ranked_sources=None):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
-    Several placements on one edge (explicit and/or regression) are one
-    candidate with several initialisations, the regression's fraction first.
-    The regression candidates are the best ``regression_k`` placements of
-    :func:`regression_candidates` (``covariation``/``tip_slack`` choose its
-    model); its score is kept for diagnostics only.
+    **Candidates** (:func:`candidate_shortlist`): ``explicit`` placements,
+    ``ranked_sources`` (``{name: [candidate, ...]}``, best first; Stage 2 passes
+    the outgroup-attachment placements as ``'attach'``) and the regression
+    sources, deduplicated by bipartition. Each result records every source that
+    proposed it and its rank there (``source``, ``source_ranks``). Several
+    placements on one edge are one candidate with several initialisations, the
+    first regression source's fraction first. Regression scores are kept for
+    diagnostics only.
+
+    Regression sources (:class:`RegressionSource`):
+
+    * default (``candidate_sources=None``): :func:`default_candidate_sources`,
+      plain regression at the baseline's rate, top ``regression_k``, and
+      covariation regression (tip_slack 3, free slope), top ``regression_k``;
+    * ``candidate_sources=plain_candidate_sources(k)``: the plain top ``k`` alone,
+      the default before the covariation source was added;
+    * any sequence of :class:`RegressionSource` (``regression_k`` is then unused);
+    * ``covariation``/``tip_slack`` (legacy, exclusive with ``candidate_sources``):
+      one regression source with that model at the baseline's fixed rate, top
+      ``regression_k``;
+    * ``regression_k=0``: none.
+
+    ``regression_rank``/``regression_chisq`` (and :attr:`RootSearchResult.regression_best`,
+    and the rate-fit extra below) refer to the *first* regression source, plain
+    by default.
 
     A candidate's optimiser uncertainty ``u`` is the tail fluctuation of its best
     trajectory, or, where alternative initialisations were run, the larger of
@@ -931,25 +1068,9 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     of each candidate keeps its copy.
     """
     fit = fit or FitConfig()
-    merged = {}
-
-    def add(c, source, info=None):
-        c = baseline.canonical(c)
-        d = merged.setdefault(candidate_key(c), {'sources': [], 'inits': [], 'info': {}})
-        if source not in d['sources']:
-            d['sources'].append(source)
-        if info:
-            d['info'] = info
-            d['inits'].insert(0, c)
-        else:
-            d['inits'].append(c)
-
-    for c in explicit:
-        add(c, 'explicit')
-    if regression_k:
-        for c, info in regression_candidates(baseline, k=regression_k, covariation=covariation,
-                                             tip_slack=tip_slack):
-            add(c, 'regression', info)
+    sources = resolve_candidate_sources(regression_k, candidate_sources, covariation, tip_slack)
+    merged = candidate_shortlist(baseline, explicit=explicit, sources=sources, ranked_sources=ranked_sources)
+    primary = sources[0].name if sources else None
 
     warm_starts = warm_starts or {}
 
@@ -964,11 +1085,12 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
 
     results = []
     for key, d in merged.items():
-        cand = d['inits'][0]
-        res = CandidateResult(candidate=cand, candidate_id=baseline.candidate_id(cand),
-                              source='+'.join(d['sources']), regression_rank=d['info'].get('regression_rank'),
-                              regression_chisq=d['info'].get('regression_chisq'))
-        for c in dict.fromkeys(d['inits']):
+        cand = d.candidate
+        info = d.regression_info.get(primary, {})
+        res = CandidateResult(candidate=cand, candidate_id=baseline.candidate_id(cand), source=d.source,
+                              regression_rank=info.get('regression_rank'),
+                              regression_chisq=info.get('regression_chisq'), source_ranks=dict(d.source_ranks))
+        for c in dict.fromkeys(d.inits):
             res.runs.append(evaluate(c, fit.initial_mode))
         if key in warm_starts:
             res.runs.append(evaluate(cand, fit.initial_mode, warm=warm_starts[key]))
@@ -1011,7 +1133,8 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         'branch_length_mode': 'marginal', 'Tc': None, 'resolve_polytomies': False, 'prune_short': False,
         'infer_gtr': False, 'time_marginal': False, 'clock_rate': baseline.clock_rate,
         'iterations': fit.iterations, 'initial_mode': fit.initial_mode, 'rng_seed': baseline.rng_seed,
-        'regression_k': regression_k, 'covariation': covariation, 'tip_slack': tip_slack,
+        'regression_k': regression_k, 'candidate_sources': [vars(x).copy() for x in sources],
+        'ranked_sources': {n: len(c) for n, c in (ranked_sources or {}).items()},
         'sensitivity_window': sensitivity_window, 'sensitivity_fractions': list(sensitivity_fractions),
         'min_margin': min_margin, 'rate_rounds': rate_rounds, 'rate_fit_window': rate_fit_window,
         'rate_fit_min': rate_fit_min, 'rate_fit_max': rate_fit_max, 'rate_span': fit.rate_span,

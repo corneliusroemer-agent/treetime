@@ -80,12 +80,17 @@ from treetime.root_candidates import (  # noqa: E402
     FitConfig,
     NodeRoot,
     UnrootedBaseline,
+    RegressionSource,
     candidate_key,
+    candidate_shortlist,
     classify_trajectory,
+    default_candidate_sources,
     evaluate_root_candidate,
     fresh_marginal_score,
+    plain_candidate_sources,
     rank_root_candidates,
     regression_candidates,
+    resolve_candidate_sources,
     restore_best_fitted_state,
     score_newick,
 )
@@ -313,9 +318,10 @@ def test_min_margin_flags_a_close_pair(b20, top):
 
 
 def test_explicit_and_regression_candidates_are_merged(b20, top):
-    res = rank_root_candidates(b20, explicit=[EdgeRoot(top.split, 0.2)], regression_k=1, fit=FitConfig(0),
-                               sensitivity_window=None, rate_rounds=0)
-    assert len(res.results) == 1 and res.best.source == 'explicit+regression'
+    res = rank_root_candidates(b20, explicit=[EdgeRoot(top.split, 0.2)], candidate_sources=plain_candidate_sources(1),
+                               fit=FitConfig(0), sensitivity_window=None, rate_rounds=0)
+    assert len(res.results) == 1 and res.best.source == 'explicit+plain'
+    assert res.best.source_ranks == {'explicit': 1, 'plain': 1}
     assert res.best.regression_rank == 1 and len(res.best.runs) == 2
     assert res.best.runs[0].initial_fraction == pytest.approx(top.fraction)  # regression fraction first
 
@@ -325,6 +331,85 @@ def test_covariation_regression_candidates(b20):
     cov = regression_candidates(b20, k=3, covariation=True, tip_slack=3)
     assert len(plain) == len(cov) == 3
     assert [i['regression_rank'] for _, i in cov] == [1, 2, 3]
+
+
+def _keys(cands):
+    return [candidate_key(c) for c, _ in cands]
+
+
+@pytest.mark.parametrize('fx', ['binary20', 'poly20', 'mixed60'])
+def test_default_shortlist_is_plain_union_covariation(fx):
+    """Default candidates: plain fixed-slope top 5 and covariation (tip_slack 3, free slope) top 5,
+    deduplicated by bipartition, each labelled with the ranks of every source that proposed it."""
+    b = make_baseline(fx)
+    plain = regression_candidates(b, k=5)
+    cov = regression_candidates(b, k=5, covariation=True, tip_slack=3.0, slope=None)
+    merged = candidate_shortlist(b, sources=default_candidate_sources(5))
+    union = list(dict.fromkeys(_keys(plain) + _keys(cov)))
+    assert list(merged) == union
+    for name, lst in (('plain', plain), ('cov', cov)):
+        for key, (c, info) in zip(_keys(lst), lst):
+            assert merged[key].source_ranks[name] == info['regression_rank']
+    for key, e in merged.items():
+        assert set(e.source_ranks) == {n for n, lst in (('plain', plain), ('cov', cov)) if key in _keys(lst)}
+        assert len(e.inits) == 1  # fitted once, from the first source's placement
+        first = plain if 'plain' in e.source_ranks else cov
+        assert e.inits[0] == dict(zip(_keys(first), [c for c, _ in first]))[key]
+
+
+def test_default_shortlist_sources_differ_and_reach_the_ranking():
+    """On mixed60 the two lists differ (so the union is larger than either), and
+    rank_root_candidates' default evaluates exactly the union."""
+    b = make_baseline('mixed60')
+    plain = set(_keys(regression_candidates(b, k=5)))
+    cov = set(_keys(regression_candidates(b, k=5, covariation=True, tip_slack=3.0, slope=None)))
+    fixed_cov = set(_keys(regression_candidates(b, k=5, covariation=True, tip_slack=3.0)))
+    assert plain & cov and cov - plain and plain - cov
+    assert cov != fixed_cov  # the free slope matters: the legacy covariation=True path ranks differently
+    res = rank_root_candidates(b, fit=FitConfig(0), keep_states=False)
+    assert {candidate_key(r.candidate) for r in res.results} == plain | cov
+    assert len(res.results) == len(plain | cov)
+    for r in res.results:
+        assert set(r.source_ranks) <= {'plain', 'cov'} and r.source == '+'.join(r.source_ranks)
+        assert (r.regression_rank is None) == ('plain' not in r.source_ranks)
+    assert {s['name'] for s in res.config['candidate_sources']} == {'plain', 'cov'}
+    row = next(r for r in res.rows() if '+' in r['source'])
+    assert row['source_ranks'].startswith('plain:') and ',cov:' in row['source_ranks']
+    assert 'source_ranks' in res.to_tsv().splitlines()[0].split('\t')
+
+
+def test_plain_only_shortlist_is_reachable():
+    """The previous default (plain fixed-slope top k alone) via candidate_sources, and the
+    legacy covariation/tip_slack arguments still give one fixed-slope source."""
+    b = make_baseline('mixed60')
+    plain = _keys(regression_candidates(b, k=5))
+    for kw in (dict(candidate_sources=plain_candidate_sources(5)), dict(covariation=False)):
+        res = rank_root_candidates(b, fit=FitConfig(0), keep_states=False, **kw)
+        assert {candidate_key(r.candidate) for r in res.results} == set(plain)
+        assert all(r.source == 'plain' and r.source_ranks['plain'] == r.regression_rank for r in res.results)
+    m = candidate_shortlist(b, sources=(RegressionSource('cov_fixed_slope', 5, covariation=True, tip_slack=3.0),))
+    assert resolve_candidate_sources(5, covariation=True, tip_slack=3.0) == (
+        RegressionSource('cov_fixed_slope', 5, covariation=True, tip_slack=3.0, slope='fixed'),)
+    assert list(m) == _keys(regression_candidates(b, k=5, covariation=True, tip_slack=3.0))
+    assert resolve_candidate_sources(0) == () and resolve_candidate_sources(0, covariation=True) == ()
+    with pytest.raises(ValueError):
+        resolve_candidate_sources(5, candidate_sources=plain_candidate_sources(), covariation=True)
+
+
+def test_shortlist_ranked_sources_and_explicit():
+    b = make_baseline('binary20')
+    plain = regression_candidates(b, k=2)
+    edge = plain[0][0]
+    assert isinstance(edge, EdgeRoot)
+    other = EdgeRoot(edge.split, 0.3 if abs(edge.fraction - 0.3) > 0.05 else 0.7)
+    extra = [b.node(hub(b)), plain[1][0]]
+    m = candidate_shortlist(b, explicit=[other], ranked_sources={'attach': extra}, sources=plain_candidate_sources(2))
+    e0, e1 = m[candidate_key(edge)], m[candidate_key(plain[1][0])]
+    assert e0.source_ranks == {'explicit': 1, 'plain': 1} and e0.inits == [edge, other]  # regression first
+    assert e1.source_ranks == {'attach': 2, 'plain': 2} and len(e1.inits) == 1  # same placement, one init
+    assert m[candidate_key(b.canonical(extra[0]))].source_ranks['attach'] == 1
+    with pytest.raises(ValueError):
+        candidate_shortlist(b, ranked_sources={'plain': extra}, sources=plain_candidate_sources(2))
 
 
 # Per-candidate clock rate ------------------------------------------------------------
@@ -416,8 +501,9 @@ def test_plots_render(b20, top, tmp_path):
 
 
 def test_candidate_labels_do_not_depend_on_hash_seed():
-    """Node names (INT_xxxx) and candidate ids are deterministic across processes
-    with different PYTHONHASHSEED values (set/frozenset iteration order)."""
+    """Node names (INT_xxxx), candidate ids and the default shortlist's order and
+    source labels are deterministic across processes with different
+    PYTHONHASHSEED values (set/frozenset iteration order)."""
     import subprocess
     import sys
     code = ("import sys; sys.path.insert(0, %r)\n"
@@ -426,7 +512,14 @@ def test_candidate_labels_do_not_depend_on_hash_seed():
             "nwk, aln, dates, _ = load('poly20')\n"
             "b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')\n"
             "print([(b.candidate_id(c), sorted(c.split)) for c in b.all_candidates()])\n"
-            "print([b.candidate_id(c) for c, _ in regression_candidates(b, 3)])\n") % os.path.dirname(os.path.abspath(__file__))
+            "print([b.candidate_id(c) for c, _ in regression_candidates(b, 3)])\n"
+            "from treetime.root_candidates import candidate_shortlist, default_candidate_sources, stable_id\n"
+            "for fx in ('poly20', 'mixed60'):\n"
+            "    nwk, aln, dates, meta = load(fx)\n"
+            "    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69', clock_rate=meta['clock_rate'])\n"
+            "    m = candidate_shortlist(b, sources=default_candidate_sources(5))\n"
+            "    print([(b.candidate_id(e.candidate), stable_id(e.candidate), e.source, sorted(e.source_ranks.items()))\n"
+            "           for e in m.values()])\n") % os.path.dirname(os.path.abspath(__file__))
     outs = []
     for seed in ('0', '7', '12345'):
         env = dict(os.environ, PYTHONHASHSEED=seed)
