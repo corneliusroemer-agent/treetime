@@ -955,6 +955,7 @@ class RootSearchResult:
     clock_rate: float
     min_margin: float
     config: dict
+    final_rate_refit: Optional[dict] = None  # see rank_root_candidates(final_rate_refit=); None when off
 
     @property
     def best(self):
@@ -980,11 +981,37 @@ class RootSearchResult:
         return next((r for r in self.results if r.regression_rank == 1), None)
 
     def best_treetime(self):
+        """The winner's retained state from ranking (at the rate it was ranked with)."""
         return restore_best_fitted_state(self.best)
+
+    def headline_treetime(self):
+        """The state behind the headline root date: the winner's final rate refit
+        when one was run and kept its state, else :meth:`best_treetime`."""
+        ref = self.final_rate_refit
+        if ref is not None and ref.get('headline') == 'refit' and ref['state'] is not None:
+            return ref['state']
+        return self.best_treetime()
+
+    @property
+    def headline_root_date(self):
+        """Root date of the winner: the final rate refit's when it ran, else the ranking fit's."""
+        ref = self.final_rate_refit
+        if ref is not None and ref.get('headline') == 'refit':
+            return ref['refit_root_date']
+        b = self.best.best_run
+        return b.root.get('root_date') if b is not None and b.error is None else None
+
+    @property
+    def headline_clock_rate(self):
+        ref = self.final_rate_refit
+        if ref is not None and ref.get('headline') == 'refit':
+            return ref['refit_clock_rate']
+        b = self.best.best_run
+        return b.clock_rate if b is not None and b.error is None else self.clock_rate
 
     def summary(self):
         reg = self.regression_best
-        return {
+        out = {
             'best': self.best.candidate_id,
             'best_logL': self.best.score,
             'margin': self.margin,
@@ -997,6 +1024,11 @@ class RootSearchResult:
             'n_candidates': len(self.results),
             'n_failed': sum(not np.isfinite(r.score) for r in self.results),
         }
+        ref = self.final_rate_refit
+        if ref is not None:
+            out.update({'headline_root_date': self.headline_root_date, 'headline_clock_rate': self.headline_clock_rate,
+                        'final_rate_refit': final_rate_refit_summary(ref)})
+        return out
 
     def rows(self):
         return [r.row(self.clock_rate) for r in self.results]
@@ -1033,6 +1065,12 @@ class RootSearchResult:
             s['best'], _fmt(s['margin'], 3), 'resolved' if s['best_is_resolved'] else
             'unresolved with ' + ', '.join(s['unresolved_with_best']), s['regression_best'],
             _fmt(s['regression_best_delta_logL'], 3)))
+        ref = self.final_rate_refit
+        if ref is not None:
+            out.append('final rate refit (%s): root date %s -> %s, rate %s -> %s, logL %s -> %s; headline: %s' % (
+                ref['candidate_id'], _fmt(ref['shared_root_date'], 2), _fmt(ref['refit_root_date'], 2),
+                _fmt(ref['shared_clock_rate'], 6), _fmt(ref['refit_clock_rate'], 6), _fmt(ref['shared_logL'], 3),
+                _fmt(ref['refit_logL'], 3), ref['headline']))
         return '\n'.join(out)
 
 
@@ -1081,11 +1119,135 @@ def resolve_candidate_sources(regression_k=5, candidate_sources=None, covariatio
     return default_candidate_sources(regression_k) if regression_k else ()
 
 
+FINAL_RATE_EVALS = 15         # profile evaluations (dated fits at fixed rate) per final refit
+FINAL_RATE_XATOL = 0.01       # tolerance on log(rate): 1% in the rate
+FINAL_RATE_ITERATIONS = 2     # (ancestral inference, time tree) iterations per profile evaluation
+
+
+def rescale_times_for_rate(state, mu0, mu):
+    """Copy of a fitted TreeTime ``state`` (a strict-clock fit at rate ``mu0``)
+    moved to rate ``mu`` at (about) fixed divergences: every internal node's
+    height below the latest tip is scaled by mu0/mu, tips keep their dates, and
+    every branch = mu x its new time span. A node is kept slightly older than
+    its oldest child (``ttconf.MIN_BRANCH_LENGTH`` mutations at ``mu``). This is the
+    starting state of a dated fit at ``mu``: a rate change at fixed divergences
+    mostly rescales times homogeneously."""
+    tt = copy.deepcopy(state)
+    t_max = max(float(n.numdate) for n in tt.tree.get_terminals())
+    f = float(mu0) / float(mu)
+    eps = ttconf.MIN_BRANCH_LENGTH * tt.one_mutation / float(mu)
+    for n in tt.tree.find_clades(order='postorder'):
+        if n.is_terminal():
+            continue
+        t = t_max - (t_max - float(n.numdate)) * f
+        n.numdate = min(t, min(float(c.numdate) for c in n.clades) - eps)
+    _rescale_rate(tt, float(mu))
+    return tt
+
+
+def fit_rate_profile(point, mu0, clamp=10.0, xatol=FINAL_RATE_XATOL, max_evals=FINAL_RATE_EVALS):
+    """Maximise a profile likelihood over the clock rate, ``point(mu) ->
+    (logL, payload)``, over log(rate) in [mu0/clamp, mu0*clamp] by bounded Brent
+    (scipy ``minimize_scalar``, 'bounded'), at most ``max_evals`` evaluations,
+    tolerance ``xatol`` on log(rate). ``converged``: Brent met the tolerance
+    within the budget and the maximum is not within 1% of a bound. Returns a
+    dict with the best point (``mu``, ``logL``, ``payload``), every evaluated
+    ``(mu, logL)`` and the flags."""
+    from scipy.optimize import minimize_scalar
+    cache = {}
+
+    def neg(x):
+        x = float(x)
+        if x not in cache:
+            cache[x] = point(float(np.exp(x)))
+        return -cache[x][0]
+
+    lo, hi = np.log(mu0 / clamp), np.log(mu0 * clamp)
+    res = minimize_scalar(neg, bounds=(lo, hi), method='bounded',
+                          options={'xatol': xatol, 'maxiter': max_evals})
+    xb = max(cache, key=lambda x: cache[x][0])
+    at_bound = min(xb - lo, hi - xb) < np.log(1.01)
+    return {'mu': float(np.exp(xb)), 'logL': cache[xb][0], 'payload': cache[xb][1],
+            'points': sorted((float(np.exp(x)), v[0]) for x, v in cache.items()),
+            'n_evals': len(cache), 'brent_converged': bool(res.success), 'at_bound': bool(at_bound),
+            'converged': bool(res.success and not at_bound)}
+
+
+def profile_rate_point(evaluate, cand, state, mu0, mu, iterations=FINAL_RATE_ITERATIONS):
+    """One point of the profile likelihood over the clock rate: the dated fit of
+    candidate ``cand`` at fixed rate ``mu`` (``evaluate(cand, mode, rounds,
+    warm=(state, mu), iterations=)``, i.e. the ranking's evaluator, so Stage 2
+    messages and Stage 3 outgroup subtrees are included), warm-started from
+    :func:`rescale_times_for_rate` (``state`` at rate ``mu0``, moved to ``mu``).
+    Returns ``(logL, FitRun)``."""
+    run = evaluate(cand, None, 0, warm=(rescale_times_for_rate(state, mu0, mu), float(mu)), iterations=iterations)
+    return (run.best_score if run.error is None else -np.inf), run
+
+
+def _final_rate_refit_one(r, evaluate, clamp, xatol, max_evals, iterations, catch_errors):
+    """Rate refit of one ranked candidate: :func:`fit_rate_profile` from its
+    best run's retained state. The ranking state itself counts as a point, so
+    the refit logL is never below the ranking logL. Returns a record dict; the
+    ranking runs are untouched.
+
+    ``shared_*`` are the candidate's best fit at the shared rate (its runs
+    without a rate fit); ``ranking_*`` its ranking score and rate, which differ
+    from ``shared_*`` only when ranking already fitted rates (``rate_rounds`` > 0)."""
+    b = r.best_run
+    shared = [x for x in r.runs if x.error is None and not x.rate_fitted]
+    s = max(shared, key=lambda x: x.best_score) if shared else None
+    rec = {'candidate_id': r.candidate_id,
+           'shared_logL': s.best_score if s else None,
+           'shared_root_date': s.root.get('root_date') if s else None,
+           'shared_clock_rate': s.clock_rate if s else None,
+           'ranking_logL': r.score, 'ranking_clock_rate': b.clock_rate, 'ranking_rate_fitted': b.rate_fitted,
+           'error': None, 'warnings': [], 'state': None, 'refit_logL': None, 'refit_root_date': None,
+           'refit_clock_rate': None, 'n_evals': 0, 'converged': None, 'at_bound': None, 'profile_points': [],
+           'refit_is_ranking_state': None, 'refit_extra': {}}
+    if b.state is None:
+        raise ValueError('final rate refit: the winner kept no state')
+    t0 = time.time()
+    try:
+        f = fit_rate_profile(lambda mu: profile_rate_point(evaluate, b.candidate, b.state, b.clock_rate, mu, iterations),
+                             b.clock_rate, clamp=clamp, xatol=xatol, max_evals=max_evals)
+    except FIT_ERRORS as exc:
+        if not catch_errors:
+            raise
+        rec['error'] = '%s: %s' % (type(exc).__name__, exc)
+    else:
+        keep_ranking = r.score >= f['logL']
+        best = b if keep_ranking else f['payload']
+        st = best.state
+        rec.update({'state': st, 'refit_logL': max(r.score, f['logL']),
+                    'refit_root_date': float(st.tree.root.numdate),
+                    'refit_clock_rate': b.clock_rate if keep_ranking else f['mu'],
+                    'n_evals': f['n_evals'], 'converged': f['converged'], 'at_bound': f['at_bound'],
+                    'profile_points': f['points'], 'refit_is_ranking_state': bool(keep_ranking),
+                    'refit_extra': dict(best.extra) if getattr(best, 'extra', None) else {}})
+        if f['at_bound']:
+            rec['warnings'].append('rate at bound')
+        elif not f['converged']:
+            rec['warnings'].append('rate refit not converged')
+    rec['runtime'] = time.time() - t0
+    return rec
+
+
+def final_rate_refit_summary(ref):
+    """JSON-friendly view of :attr:`RootSearchResult.final_rate_refit` (no FitRun objects)."""
+    out = {k: v for k, v in ref.items() if k not in ('state', 'close')}
+    if ref.get('close') is not None:
+        out['close'] = [{k: v for k, v in c.items() if k != 'state'} for c in ref['close']]
+    return out
+
+
+
 def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensitivity_window=None,
                          sensitivity_fractions=(0.1, 0.5, 0.9), min_margin=1.0, covariation=None,
                          tip_slack=None, keep_states=True, catch_errors=False, rate_rounds=0, rate_fit_window=5.0,
                          rate_fit_min=3, rate_fit_max=15, rate_fit_extra=(), warm_starts=None,
-                         candidate_sources=None, ranked_sources=None, evaluator=None):
+                         candidate_sources=None, ranked_sources=None, evaluator=None, final_rate_refit=False,
+                         final_rate_evals=FINAL_RATE_EVALS, final_rate_xatol=FINAL_RATE_XATOL,
+                         final_rate_iterations=FINAL_RATE_ITERATIONS, final_rate_refit_window=None):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
@@ -1148,6 +1310,43 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     (``rate_fitted`` column). Their sensitivity re-fits use the same rate setting.
     ``rate_rounds=0`` uses the shared rate throughout.
 
+    **Final rate refit** (``final_rate_refit=True``, opt-in). After ranking, the
+    winner alone gets a clock rate of its own: :func:`fit_rate_profile`
+    maximises the profile likelihood over the rate (bounded Brent on log rate
+    within ``fit.rate_clamp`` of the winner's rate, at most ``final_rate_evals``
+    evaluations, tolerance ``final_rate_xatol`` on log rate). Each evaluation is
+    the winner's dated fit at that fixed rate through the ranking's evaluator
+    (so ``evaluator=``, e.g. Stage 3's outgroup subtree, applies), warm-started
+    from its retained best state with node times rescaled to that rate
+    (:func:`rescale_times_for_rate`; ``final_rate_iterations`` iterations; states are kept internally
+    for this even with ``keep_states=False`` and dropped afterwards). The
+    ranking state counts as a point, so the refit logL is never below the
+    winner's ranking logL. Selection is unchanged: ranks, scores, verdicts and
+    rows stay those of the ranking. The refit is reported in
+    :attr:`RootSearchResult.final_rate_refit` (dict: shared, ranking and refit
+    root date, clock rate and logL, ``converged``, ``at_bound``, ``n_evals``,
+    ``profile_points``, ``headline``) as a diagnostic: the headline root date
+    and rate (:attr:`RootSearchResult.headline_root_date`, ``headline_clock_rate``,
+    :meth:`RootSearchResult.headline_treetime`) stay those of the shared-rate
+    ranking (``headline`` 'shared'). The reason: with a shared regression rate the root date
+    inherits the regression's rate error, which dominates root-date error under
+    weak temporal signal. ``converged`` is False (warning 'rate refit not
+    converged', or 'rate at bound') when Brent did not meet the tolerance within
+    the budget or the maximum lies at the clamp. ``final_rate_refit=False``
+    gives exactly the output without it (``final_rate_refit`` None, summary
+    without the headline keys). It is off by default: on simulated weak-signal
+    data the rate profile is flat towards low rates and its maximum lies far
+    from the true rate more often than the shared regression rate does, and
+    the dated fit at a fixed rate can reach different fixed points from
+    different starting states (investigation report 49).
+
+    ``final_rate_refit_window`` (opt-in, report only; e.g. ``CLOSE_ODDS_WINDOW``
+    = log 3, 3:1 odds): every other candidate within this many log units of the
+    winner is rate-refitted the same way, and ``final_rate_refit['close']`` lists
+    them with ``close_refit_best`` and ``close_order_changed`` (whether the
+    refitted logLs would order them differently). The winner and the headline
+    never change because of it.
+
     ``warm_starts``: ``{candidate_key: (TreeTime, clock_rate)}``; each listed
     candidate gets one more trajectory started from that fitted state
     (``initial_mode`` 'warm', see :func:`evaluate_root_candidate`), so its score
@@ -1168,14 +1367,16 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     primary = sources[0].name if sources else None
 
     warm_starts = warm_starts or {}
+    keep_internal = keep_states or bool(final_rate_refit)  # the final refit warm-starts from the winner's state
 
-    def evaluate(c, mode, rounds=0, warm=None):
+    def evaluate(c, mode, rounds=0, warm=None, iterations=None):
         if mode == 'warm':  # a warm run's rate fit restarts from the same state
             warm, mode = warm_starts[candidate_key(baseline.canonical(c))], fit.initial_mode
-        cfg = FitConfig(fit.iterations, mode, rate_rounds=rounds, rate_span=fit.rate_span, rate_clamp=fit.rate_clamp,
+        cfg = FitConfig(fit.iterations if iterations is None else iterations, mode or fit.initial_mode,
+                        rate_rounds=rounds, rate_span=fit.rate_span, rate_clamp=fit.rate_clamp,
                         rate_xatol=fit.rate_xatol)
         state, mu = warm if warm is not None else (None, None)
-        return (evaluator or evaluate_root_candidate)(baseline, c, cfg, keep_state=keep_states,
+        return (evaluator or evaluate_root_candidate)(baseline, c, cfg, keep_state=keep_internal,
                                                       catch_errors=catch_errors, clock_rate=mu, initial_state=state)
 
     results = []
@@ -1212,12 +1413,32 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
                     r.runs.append(evaluate(alt, mode, rate_rounds if r.rate_fitted else 0))
         results.sort(key=lambda r: -r.score)
 
-    if keep_states:
+    if keep_internal:
         for r in results:
             b = r.best_run
             for x in r.runs:
                 if x is not b:
                     x.state = None
+    refit = None
+    if final_rate_refit and results and np.isfinite(results[0].score):
+        rargs = (evaluate, fit.rate_clamp, final_rate_xatol, final_rate_evals, final_rate_iterations, catch_errors)
+        refit = _final_rate_refit_one(results[0], *rargs)
+        refit['headline'] = 'shared'  # diagnostic only: the ML rate is biased low on flat profiles (report 49b)
+        if final_rate_refit_window is not None:
+            top = results[0].score
+            close = [refit] + [_final_rate_refit_one(r, *rargs) for r in results[1:]
+                               if np.isfinite(r.score) and top - r.score <= final_rate_refit_window]
+            order = sorted(close, key=lambda c: -(c['refit_logL'] if c['refit_logL'] is not None else -np.inf))
+            refit['close'] = [dict(c, refit_rank=order.index(c) + 1) for c in close]
+            refit['close_refit_best'] = order[0]['candidate_id']
+            refit['close_order_changed'] = [c['candidate_id'] for c in order] != [c['candidate_id'] for c in close]
+    if not keep_states and keep_internal:
+        for r in results:
+            for x in r.runs:
+                x.state = None
+        if refit is not None:
+            for c in [refit] + refit.get('close', []):
+                c['state'] = None
     if results:
         top = results[0]
         for r in results:
@@ -1235,7 +1456,12 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         'rate_fit_min': rate_fit_min, 'rate_fit_max': rate_fit_max, 'rate_span': fit.rate_span,
         'rate_clamp': fit.rate_clamp, 'warm_starts': len(warm_starts),
     }
-    return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config)
+    if final_rate_refit:
+        config.update({'final_rate_refit': True, 'final_rate_evals': final_rate_evals,
+                       'final_rate_xatol': final_rate_xatol, 'final_rate_iterations': final_rate_iterations,
+                       'final_rate_refit_window': final_rate_refit_window})
+    return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config,
+                            final_rate_refit=refit)
 
 
 # --------------------------------------------------------------------------

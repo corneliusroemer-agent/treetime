@@ -602,7 +602,8 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
             extra_rows.append(dict(row, source='extra(listed)'))
     if new:
         xkw = {k: v for k, v in rank_kwargs.items() if k not in ('ranked_sources', 'candidate_sources',
-                                                                 'covariation', 'tip_slack')}
+                                                                 'covariation', 'tip_slack', 'final_rate_refit',
+                                                                 'final_rate_refit_window')}
         x1 = rank_root_candidates(baseline, explicit=new, regression_k=0, keep_states=True, candidate_sources=(),
                                   **xkw)
         x3 = rank_root_candidates(baseline, explicit=new, regression_k=0, keep_states=True, candidate_sources=(),
@@ -613,6 +614,9 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
             for r in res.results:
                 for x in r.runs:
                     x.state = None
+            if res.final_rate_refit is not None:
+                for c in [res.final_rate_refit] + (res.final_rate_refit.get('close') or []):
+                    c['state'] = None
     config = {'outer_iterations': outer_iterations, 'tol': tol, 'fit_lengths': fit_lengths,
               'attach_k': attach_k, 'regression_k': regression_k, 'warm_start': warm_start, 'mixture_ws': mixture_ws,
               'outgroup_newick': outgroup.newick(), 'n_outgroup_patterns': outgroup.n_patterns}

@@ -367,3 +367,34 @@ def test_given_stage1_must_match_2b_candidates(b20, fitted):
     assert {candidate_key(r.candidate) for r in res.stage2b.results} == \
         {candidate_key(r.candidate) for r in s1.results}
     assert all(row['combined_2b'] is not None for row in res.rows)
+
+
+def test_final_rate_refit_carries_root_state_messages(b20, fitted):
+    """2b's final rate refit runs on the message baseline: its state carries the messages, its logL is the
+    combined score, and it is >= the 2b winner's logL. The winners are unchanged."""
+    b, true = b20
+    tt = fitted.state
+    o = tt.tree.root._cseq[tt.data.full_to_compressed_sequence_map]
+    msg = outgroup_leaf_messages(tt.gtr, o, 0.02)
+    kw = dict(explicit=[true], regression_k=2, fit=FIT, candidate_sources=plain_candidate_sources(2))
+    on = rank_with_root_messages(b, msg, final_rate_refit=True, **kw)
+    off = rank_with_root_messages(b, msg, **kw)
+    for name in ('stage1', 'stage2b'):
+        res_on, res_off = getattr(on, name), getattr(off, name)
+        assert res_on.best.candidate_id == res_off.best.candidate_id
+        assert [r.score for r in res_on.results] == [r.score for r in res_off.results]
+        ref = res_on.final_rate_refit
+        assert ref['candidate_id'] == res_on.best.candidate_id and ref['refit_logL'] >= ref['shared_logL']
+        assert res_off.final_rate_refit is None
+    ref2b = on.stage2b.final_rate_refit
+    st = ref2b['state']
+    assert st.root_state_message is not None
+    assert on.stage1.final_rate_refit['state'].root_state_message is None
+    # the refit state's logL is the combined (ingroup + message) score, and rescoring it reproduces that
+    assert fresh_marginal_score(copy.deepcopy(st)) == pytest.approx(ref2b['refit_logL'], abs=1e-8)
+    assert float(st.tree.total_sequence_LH) == pytest.approx(
+        float(st.tree.total_sequence_LH_ingroup) + float(st.tree.total_root_message_LH), abs=1e-8)
+    assert on.rows == off.rows
+    s = on.summary()
+    assert s['stage2b_headline_root_date'] == ref2b['shared_root_date']
+    assert 'stage2b_headline_root_date' not in off.summary()

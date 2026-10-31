@@ -37,9 +37,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .root_candidates import (candidate_key, candidate_shortlist, format_source_ranks, outgroup_candidate_sources,
-                              rank_root_candidates, resolve_candidate_sources, restore_best_fitted_state,
-                              fresh_marginal_score)
+from .root_candidates import (candidate_key, candidate_shortlist, final_rate_refit_summary, format_source_ranks,
+                              outgroup_candidate_sources, rank_root_candidates, resolve_candidate_sources,
+                              restore_best_fitted_state, fresh_marginal_score)
 from .seq_utils import normalize_profile, seq2prof
 
 
@@ -191,13 +191,19 @@ class Stage2Result:
         return sc[0] - sc[1] if len(sc) > 1 else None
 
     def summary(self):
-        return {
+        out = {
             'stage1_best': self.stage1.best.candidate_id, 'stage1_margin': self.stage1.margin,
             'stage1_resolved': self.stage1.best_is_resolved,
             'stage2a_best': self.best('combined_2a'), 'stage2a_margin': self.margin('combined_2a'),
             'stage2b_best': self.stage2b.best.candidate_id, 'stage2b_margin': self.stage2b.margin,
             'stage2b_resolved': self.stage2b.best_is_resolved,
         }
+        for name, res in (('stage1', self.stage1), ('stage2b', self.stage2b)):
+            if res.final_rate_refit is not None:
+                out.update({name + '_headline_root_date': res.headline_root_date,
+                            name + '_headline_clock_rate': res.headline_clock_rate,
+                            name + '_final_rate_refit': final_rate_refit_summary(res.final_rate_refit)})
+        return out
 
     def to_tsv(self, path):
         cols = list(self.rows[0].keys()) if self.rows else []
@@ -281,6 +287,12 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
        ``warm_start`` (default) each candidate also gets a trajectory that
        starts from its Stage 1 best state (step 0 of that trajectory is exactly
        the 2a state), so its 2b score is never below its 2a score.
+    4. Final rate refit (``final_rate_refit=True``, opt-in, passed to both
+       rankings like every ``rank_kwargs``): each ranking's winner is refitted
+       with its own clock rate; for 2b the refit runs on the message baseline,
+       so it carries the root-state messages. The winners do not change;
+       ``summary()`` adds ``stage1_``/``stage2b_headline_root_date``, the rate
+       and the refit record.
 
     Per-candidate rows: ingroup-only, correction and combined at the Stage 1 fit
     (2a); the same three at the 2b state; refit minus post hoc; which 2b run won
@@ -356,5 +368,8 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
             for r in res.results:
                 for x in r.runs:
                     x.state = None
+            if res.final_rate_refit is not None:
+                for c in [res.final_rate_refit] + (res.final_rate_refit.get('close') or []):
+                    c['state'] = None
     return Stage2Result(stage1=stage1, stage2b=s2b, rows=rows)
 

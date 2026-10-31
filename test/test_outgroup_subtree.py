@@ -430,3 +430,23 @@ def test_mixture_in_driver_leaves_answer_unchanged():
         assert np.isfinite(row['mixture'][0.3])
     rk = r1.mixture_ranking(0.3)
     assert len(rk) == len(r1.rows) and rk[0][1] >= rk[-1][1]
+
+
+def test_stage3_final_rate_refit_carries_the_outgroup_subtree():
+    """final_rate_refit=True through rank_with_outgroup_subtree: the refit runs through OutgroupEvaluator, so its
+    state carries the outgroup-subtree messages at its own fitted outgroup lengths, and its logL is that combined
+    score. The winner is the Stage 3 winner."""
+    nwk, aln, dates, _ = load('binary20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69', clock_rate=2 * load('binary20')[3]['clock_rate'])
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    o = OutgroupSubtree(b.gtr, _outgroups(seqs, len(next(iter(seqs.values())))))
+    r = rank_with_outgroup_subtree(b, o, regression_k=2, attach_k=1, fit=FitConfig(iterations=1), outer_iterations=1,
+                                   final_rate_refit=True)
+    ref = r.stage3.final_rate_refit
+    assert ref['candidate_id'] == r.stage3.best.candidate_id and ref['refit_logL'] >= ref['shared_logL']
+    assert not ref['refit_is_ranking_state'] and ref['refit_clock_rate'] != b.clock_rate
+    st, lengths = ref['state'], ref['refit_extra']['outgroup_lengths']
+    assert st.root_state_message is not None
+    assert {x.name for x in st.tree.get_terminals()} == set(seqs)  # outgroups are messages, not dated leaves
+    assert abs(o.combined_score(copy.deepcopy(st), lengths) - ref['refit_logL']) < 1e-8
+    assert r.stage1.final_rate_refit['state'].root_state_message is None  # Stage 1's refit has no outgroup

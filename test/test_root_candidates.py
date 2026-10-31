@@ -95,6 +95,9 @@ from treetime.root_candidates import (  # noqa: E402
     resolve_candidate_sources,
     restore_best_fitted_state,
     score_newick,
+    fit_rate_profile,
+    profile_rate_point,
+    rescale_times_for_rate,
 )
 
 FIT1 = FitConfig(iterations=1)
@@ -576,3 +579,122 @@ def test_candidate_labels_do_not_depend_on_hash_seed():
         outs.append(subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True,
                                    check=True).stdout)
     assert outs[0] == outs[1] == outs[2] and outs[0].strip()
+
+
+# --------------------------------------------------------------------------
+# final rate refit of the winner
+# --------------------------------------------------------------------------
+def _rows_without_runtime(res):
+    return [{k: v for k, v in r.items() if k != 'runtime'} for r in res.rows()]
+
+
+@pytest.fixture(scope='module')
+def refit_pair():
+    """binary20 ranked at a shared rate 2x the simulated one, with and without the final rate refit."""
+    b = make_baseline('binary20', clock_rate=2 * load('binary20')[3]['clock_rate'])
+    kw = dict(regression_k=2, fit=FIT1, candidate_sources=plain_candidate_sources(2))
+    return b, rank_root_candidates(b, **kw), rank_root_candidates(b, final_rate_refit=True, **kw)
+
+
+def test_final_rate_refit_keeps_the_winner_and_improves_logL(refit_pair):
+    b, off, on = refit_pair
+    ref = on.final_rate_refit
+    # selection is untouched: same winner, same rows (scores, ranks, verdicts, root dates)
+    assert on.best.candidate_id == off.best.candidate_id == ref['candidate_id']
+    assert _rows_without_runtime(on) == _rows_without_runtime(off)
+    assert ref['headline'] == 'shared' and ref['n_evals'] <= 15
+    assert ref['ranking_logL'] == ref['shared_logL'] and not ref['ranking_rate_fitted']
+    assert ref['converged'] is True and ref['at_bound'] is False and ref['warnings'] == []
+    # the ranking state counts as a point: refit logL >= shared-rate logL
+    assert ref['refit_logL'] >= ref['shared_logL'] == on.best.score
+    assert ref['shared_clock_rate'] == b.clock_rate and ref['shared_root_date'] == on.best.best_run.root['root_date']
+    # started at 2x the simulated rate, the refit moves the rate (and so the date) and improves the fit
+    assert ref['refit_logL'] > ref['shared_logL'] and ref['refit_clock_rate'] < b.clock_rate
+    # diagnostic only: the headline stays on the shared-rate ranking
+    assert on.headline_root_date == ref['shared_root_date'] != ref['refit_root_date']
+    assert on.headline_clock_rate == ref['shared_clock_rate']
+    assert on.headline_treetime() is on.best_treetime()
+    assert on.best_treetime() is on.best.best_run.state  # ranking state still reachable
+    s = on.summary()
+    assert s['headline_root_date'] == ref['shared_root_date'] and 'state' not in s['final_rate_refit']
+    json.loads(on.to_json())
+    assert 'final rate refit' in on.table()
+
+
+def test_final_rate_refit_off_by_default_reproduces_old_output(refit_pair):
+    b, off, on = refit_pair
+    assert off.final_rate_refit is None
+    s_off, s_on = off.summary(), on.summary()
+    assert 'headline_root_date' not in s_off and 'final_rate_refit' not in off.config
+    assert {k: v for k, v in s_on.items() if k in s_off} == s_off
+    assert {k: v for k, v in on.config.items() if k in off.config} == off.config
+    assert off.headline_root_date == off.best.best_run.root['root_date']
+    assert off.headline_treetime() is off.best_treetime()
+    assert 'final rate refit' not in off.table()
+
+
+def test_final_rate_refit_without_states_and_close_window(refit_pair):
+    b, off, on = refit_pair
+    kw = dict(regression_k=2, fit=FIT1, candidate_sources=plain_candidate_sources(2))
+    cold = rank_root_candidates(b, keep_states=False, final_rate_refit=True, final_rate_refit_window=50.0, **kw)
+    ref = cold.final_rate_refit
+    assert cold.best.candidate_id == on.best.candidate_id
+    # states are kept internally for the warm start, then dropped as asked
+    assert ref['state'] is None
+    assert all(x.state is None for r in cold.results for x in r.runs)
+    assert all(c['state'] is None for c in ref['close'])
+    assert ref['refit_logL'] == on.final_rate_refit['refit_logL']  # same refit as with keep_states=True
+    assert len(ref['close']) == len(cold.results) and ref['close'][0]['candidate_id'] == cold.best.candidate_id
+    assert sorted(c['refit_rank'] for c in ref['close']) == list(range(1, len(ref['close']) + 1))
+    assert isinstance(ref['close_order_changed'], bool) and ref['close_refit_best'] in [r.candidate_id for r in cold.results]
+    assert cold.headline_root_date == ref['shared_root_date']  # the refits never change the headline
+    json.loads(cold.to_json())
+
+
+def test_final_rate_refit_continues_a_ranking_rate_fit(refit_pair):
+    """With rate_rounds > 0 the refit continues from the rate-fitted winner; shared_* stay the shared-rate fit."""
+    b, off, on = refit_pair
+    res = rank_root_candidates(b, regression_k=2, fit=FIT1, candidate_sources=plain_candidate_sources(2),
+                               rate_rounds=1, rate_fit_min=1, final_rate_refit=True)
+    ref = res.final_rate_refit
+    assert ref['ranking_rate_fitted'] and ref['ranking_logL'] == res.best.score
+    assert ref['shared_clock_rate'] == b.clock_rate and ref['ranking_clock_rate'] != b.clock_rate
+    assert ref['refit_logL'] >= ref['ranking_logL'] >= ref['shared_logL']
+    assert ref['refit_logL'] > ref['ranking_logL'] and ref['refit_clock_rate'] != ref['ranking_clock_rate']
+
+
+def test_rate_profile_fit_reaches_the_grid_maximum(refit_pair):
+    """fit_rate_profile's answer is the maximum of the profile likelihood over the rate, checked against a coarse
+    grid over the whole clamp range and a fine grid (2% steps) around the fitted rate."""
+    b, off, on = refit_pair
+    win, mu0 = off.best.best_run, b.clock_rate
+
+    def ev(c, mode, rounds, warm=None, iterations=None):
+        return evaluate_root_candidate(b, c, FitConfig(iterations, rate_rounds=rounds), clock_rate=warm[1],
+                                       initial_state=warm[0])
+
+    def point(mu):
+        return profile_rate_point(ev, win.candidate, win.state, mu0, mu)
+
+    f = fit_rate_profile(point, mu0)
+    assert f['converged'] and f['n_evals'] <= 15
+    coarse = [point(mu0 * m)[0] for m in np.exp(np.linspace(np.log(0.1), np.log(10), 9))]
+    fine = [point(f['mu'] * m)[0] for m in np.exp(np.linspace(-0.2, 0.2, 21))]
+    # within 0.1 logL of both grids' maxima (near its top the profile is flat: < 0.1 logL over ~10% in rate)
+    assert f['logL'] >= max(coarse) - 0.1 and f['logL'] >= max(fine) - 0.1
+    # the refit inside rank_root_candidates is this optimisation, from the same state
+    assert on.final_rate_refit['refit_logL'] == pytest.approx(max(f['logL'], off.best.score), abs=1e-6)
+
+
+def test_rescale_times_for_rate_keeps_divergences(refit_pair):
+    b, off, on = refit_pair
+    st, mu0 = off.best.best_run.state, b.clock_rate
+    tt = rescale_times_for_rate(st, mu0, 0.5 * mu0)
+    t_max = max(n.numdate for n in st.tree.get_terminals())
+    for n0, n1 in zip(st.tree.find_clades(), tt.tree.find_clades()):
+        if n0.is_terminal():
+            assert n1.numdate == n0.numdate
+        else:
+            assert t_max - n1.numdate == pytest.approx(2 * (t_max - n0.numdate))
+        if n0.up is not None and not n0.is_terminal():
+            assert n1.branch_length == pytest.approx(n0.branch_length, rel=1e-9)  # internal edges: same divergence
