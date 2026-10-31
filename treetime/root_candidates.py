@@ -88,6 +88,13 @@ def candidate_key(cand):
     return (cand.kind, cand.split)
 
 
+def stable_id(cand):
+    """Identifier that depends only on the leaf bipartition, not on node names or
+    on the input tree's rooting: kind plus a short hash of the sorted leaf set."""
+    import hashlib
+    return '%s:%s' % (cand.kind, hashlib.sha1(','.join(sorted(cand.split)).encode()).hexdigest()[:10])
+
+
 # --------------------------------------------------------------------------
 # baseline: unrooted topology + shared model
 # --------------------------------------------------------------------------
@@ -600,6 +607,8 @@ class CandidateResult:
         ok = b is not None and b.error is None
         return {
             'candidate_id': self.candidate_id,
+            'stable_id': stable_id(self.candidate),
+            'split': sorted(self.candidate.split),
             'kind': self.candidate.kind,
             'source': self.source,
             'regression_rank': self.regression_rank,
@@ -632,7 +641,7 @@ class CandidateResult:
         }
 
 
-TSV_COLS = ['candidate_id', 'kind', 'source', 'regression_rank', 'regression_chisq', 'logL', 'delta_logL',
+TSV_COLS = ['candidate_id', 'stable_id', 'kind', 'source', 'regression_rank', 'regression_chisq', 'logL', 'delta_logL',
             'positional_LH', 'cached_LH', 'clock_rate', 'initial_fraction', 'initial_mode', 'fitted_fraction',
             'root_date', 'root_degree', 'root_child_lengths', 'iterations_performed', 'best_iteration',
             'treetime_stop_iteration', 'trajectory_class', 'tail_fluctuation', 'n_initialisations',

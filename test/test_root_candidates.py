@@ -311,6 +311,16 @@ def test_classify_trajectory():
     assert classify_trajectory([1.0, 2.0, 3.0]) == 'drifting'
 
 
+def test_stable_id_does_not_depend_on_input_rooting(b20):
+    from treetime.root_candidates import stable_id
+    nwk, aln, dates, meta = load('binary20')
+    tree = Phylo.read(nwk, 'newick')
+    tree.root_with_outgroup(tree.get_terminals()[5])
+    other = UnrootedBaseline(tree, aln, dates, clock_rate=meta['clock_rate'], optimize_baseline=False)
+    ref = make_baseline('binary20', optimize_baseline=False)
+    assert {stable_id(c) for c in other.all_candidates()} == {stable_id(c) for c in ref.all_candidates()}
+
+
 def test_duplicate_internal_labels_are_renamed():
     """Tree-builder labels (e.g. support values) on internal nodes need not be unique."""
     nwk, aln, dates, meta = load('binary20')
