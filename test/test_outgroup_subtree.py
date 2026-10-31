@@ -317,3 +317,36 @@ def test_stage3_rounds_monotone_and_extras_do_not_change_answer(ranked):
     same = [r for r in s3x.extra if r.candidate_id == s1.results[-1].candidate_id][0]
     ref = [r for r in s3.stage3.results if r.candidate_id == same.candidate_id][0]
     assert same.score == ref.score  # an extra is scored exactly as a listed candidate
+
+
+def test_attachment_mixture(fx):
+    from treetime.outgroup_subtree import attachment_mixture_scores
+    og = subtree(fx)
+    sc, det = attachment_mixture_scores(fx['b'], fx['tt'], og)
+    g = og.state_groups(copy.deepcopy(fx['tt']))
+    assert abs(sc[0.0] - og.optimise_lengths(g)[1]) < 1e-9  # w = 0: the candidate's own attachment
+    assert det['n_neighbours'] >= 2
+    # one neighbour term against the full-tree brute force: ingroup rerooted at that midpoint + outgroup
+    from treetime.outgroup_subtree import _unrooted_from_state, _rooted_on_edge
+    adj, names, nb = _unrooted_from_state(copy.deepcopy(fx['tt']))
+    a, b = nb[0]
+    t = _rooted_on_edge(adj, names, a, b)
+    ta = fx['b'].make_treeanc(copy.deepcopy(t), messages=False)
+    th, s1, _ = og.optimise_lengths(ta)
+    sub = og_tree().root
+    # same lengths into the explicit subtree: X = root of OG_NWK, edges in OutgroupSubtree order
+    lens = dict(zip(og.edge_names, th))
+    for c in sub.find_clades():
+        if c.is_terminal():
+            c.branch_length = lens[c.name]
+    inner = [c for c in sub.clades if not c.is_terminal()][0]
+    inner.branch_length = [v for k, v in lens.items() if k.startswith('node')][0]
+    sub.branch_length = th[0]
+    t.root.clades.append(sub)
+    sb = brute(t, dict(fx['seqs'], **fx['ogs']), fx['b'].gtr, fx['tt'].one_mutation)
+    assert abs(s1 - sb) < TOL
+    assert abs(det['neighbours'][0] - s1) < 1e-9
+    # mixture is a likelihood mixture: between min and max term
+    w = 0.3
+    terms = [det['at_root']] + det['neighbours']
+    assert min(terms) - 1e-9 <= sc[w] <= max(terms) + 1e-9

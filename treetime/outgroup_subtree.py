@@ -21,14 +21,19 @@ compressed patterns by (ingroup pattern, outgroup pattern), which is the grouped
 form sum_{g,o} n_{g,o} log sum_a pi_a l_g(a) m_o(a). The full alignment is never
 expanded.
 
-Robust message (optional): with ``eps`` > 0 each site's message is the mixture
+Site-wise mixture ``eps`` (default 0, off): m'_i(a) = (1 - eps) m_i(a) + eps c_i
+with c_i = sum_b pi_b L_X,i(b), the d -> infinity limit of m_i. It is a proper
+likelihood, but **not a cap on the outgroup's pull**: any per-site mixture whose
+second component does not depend on the root state is a stem change plus a
+candidate-independent constant. Under F81/JC, e^{Qt} = e^{-mu t} I +
+(1 - e^{-mu t}) 1 pi^T is affine in e^{-mu t}, so the mixture is exactly a
+longer stem; under GTR approximately. With the stem fitted per candidate, eps
+therefore acts only as a minimum effective stem length.
 
-    m'_i(a) = (1 - eps) m_i(a) + eps c_i,   c_i = sum_b pi_b L_X,i(b),
-
-i.e. with probability eps a site of the outgroup carries no information about
-the ingroup root (it is drawn as if the stem were infinitely long: c_i is the
-d -> infinity limit of m_i, constant in a). The mixture is still a likelihood,
-so scores remain comparable across candidates and outgroup lengths.
+Attachment mixture (post hoc, :func:`attachment_mixture_scores`): the outgroup
+attaches at the candidate root with probability 1 - w and, with probability w,
+uniformly at one of the neighbouring attachment points. This is the
+robustness lever against an outgroup that joins one edge off the true root.
 """
 import copy
 import io
@@ -250,7 +255,8 @@ class OutgroupSubtree:
     def message_table(self, lengths=None, eps=0.0):
         """Messages per outgroup pattern, (n_patterns, n_states), absolute
         scale; neutral patterns are exactly 1. ``eps``: site-wise mixture
-        with the uninformative message c = sum_b pi_b L_X(b)."""
+        with the uninformative message c = sum_b pi_b L_X(b), equivalent to a
+        longer stem (see the module docstring), default off."""
         th = self._check(lengths)
         lx = self.conditional(th)
         m = lx @ self.gtr.expQt(th[0])  # single leaf at X: the expression of outgroup_leaf_messages
@@ -537,3 +543,74 @@ def rank_with_outgroup(baseline, outgroup, eps=0.0, explicit=(), regression_k=5,
             out.extra.append(r3)
             out.extra_rows.append(_row(outgroup, r1, r3, diag, extra=True))
     return out
+
+
+# --------------------------------------------------------------------------
+# attachment mixture (post hoc)
+# --------------------------------------------------------------------------
+def _unrooted_from_state(tt):
+    """Adjacency {node_id: {node_id: length}} of a fitted TreeAnc/TreeTime at the
+    lengths it propagates with; a bifurcating root is suppressed (its two edges
+    merged). Returns (adj, names, root_neighbour_edges)."""
+    nodes = list(tt.tree.find_clades(order='preorder'))
+    idx = {id(n): i for i, n in enumerate(nodes)}
+    adj = {i: {} for i in range(len(nodes))}
+    for n in nodes:
+        for c in n.clades:
+            t = float(tt._branch_length_to_gtr(c))
+            adj[idx[id(n)]][idx[id(c)]] = t
+            adj[idx[id(c)]][idx[id(n)]] = t
+    names = {idx[id(n)]: n.name for n in nodes if n.is_terminal()}
+    r = 0
+    kids = list(adj[r])
+    if len(kids) == 2:  # root on an edge (u, v): neighbours are the other edges at u and at v
+        u, v = kids
+        t = adj[r][u] + adj[r][v]
+        del adj[u][r], adj[v][r], adj[r]
+        adj[u][v] = adj[v][u] = t
+        nb = [(u, w) for w in adj[u] if w != v] + [(v, w) for w in adj[v] if w != u]
+    else:  # root at a node: neighbours are its incident edges
+        nb = [(r, w) for w in kids]
+    return adj, names, nb
+
+
+def _rooted_on_edge(adj, names, a, b, frac=0.5):
+    from Bio.Phylo.BaseTree import Clade, Tree
+
+    def build(v, p, bl):
+        return Clade(name=names.get(v), branch_length=bl,
+                     clades=[build(w, v, adj[v][w]) for w in sorted(adj[v]) if w != p])
+    t = adj[a][b]
+    root = Clade(name='ATTACH_ROOT', branch_length=0.0, clades=[build(a, b, t * frac), build(b, a, t * (1 - frac))])
+    return Tree(root=root, rooted=True)
+
+
+def attachment_mixture_scores(baseline, tt, outgroup, ws=(0.0, 0.1, 0.3, 0.5), eps=0.0, lengths=None):
+    """Post-hoc attachment mixture at a fitted ingroup state ``tt`` rooted at the
+    candidate R (no messages of its own needed; its ingroup part is used).
+
+    L_w = (1 - w) L(attach at R) + w mean_e L(attach at the midpoint of e), over
+    the neighbouring edges e: for a root inside an edge (u, v), every other edge
+    incident to u or v (one edge away); for a root at a node, its incident edges.
+    Each term is the joint likelihood of ingroup and outgroup at ``tt``'s branch
+    lengths with the outgroup lengths fitted for that attachment (by the pulley
+    identity the ingroup tree rerooted at the attachment point, with the outgroup
+    message there). Returns ({w: log L_w}, details)."""
+    from scipy.special import logsumexp
+    base = copy.deepcopy(tt)
+    if base.root_state_message is not None:
+        base.set_root_state_messages(None)
+    th0 = outgroup.lengths if lengths is None else lengths
+    th_r, s_r, _ = outgroup.optimise_lengths(base, th0, eps)
+    adj, names, nb = _unrooted_from_state(base)
+    s_nb = []
+    for a, b in nb:
+        ta = baseline.make_treeanc(_rooted_on_edge(adj, names, a, b), messages=False)
+        s_nb.append(outgroup.optimise_lengths(ta, th_r, eps)[1])
+    out = {}
+    for w in ws:
+        if w == 0 or not s_nb:
+            out[w] = s_r
+        else:
+            out[w] = float(logsumexp([np.log1p(-w) + s_r] + [np.log(w / len(s_nb)) + x for x in s_nb]))
+    return out, {'at_root': s_r, 'neighbours': s_nb, 'n_neighbours': len(s_nb)}
