@@ -35,7 +35,12 @@ def base_regression(Q, slope=None):
         only_intercept = True
 
     intercept = (Q[davgii] - Q[tavgii] * slope) / Q[sii]
-    if (Q[tsqii] - Q[tavgii] ** 2 / Q[sii]) > 0:
+    if only_intercept:
+        # residual of the fit with the slope fixed and only the intercept free
+        chisq = 0.5 * (
+            Q[dsqii] - 2 * slope * Q[dtavgii] + slope**2 * Q[tsqii] - (Q[davgii] - slope * Q[tavgii]) ** 2 / Q[sii]
+        )
+    elif (Q[tsqii] - Q[tavgii] ** 2 / Q[sii]) > 0:
         chisq = 0.5 * (
             Q[dsqii]
             - Q[davgii] ** 2 / Q[sii]

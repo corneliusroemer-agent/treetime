@@ -49,6 +49,26 @@ def test_rank_roots_first_entry_is_find_best_root(covariation, fixed_slope):
     assert len({id(r['node']) for r in ranked}) == len(ranked)
 
 
+def test_fixed_slope_chisq_is_the_intercept_only_residual():
+    """With the slope fixed, chisq is the residual of the best intercept at that slope, not the
+    free-slope residual (which base_regression returned whatever slope was passed)."""
+    import numpy as np
+    from treetime.treeregression import base_regression, dsqii, dtavgii, davgii, sii, tavgii, tsqii
+
+    rng = np.random.default_rng(1)
+    t = rng.uniform(2000, 2020, 30)
+    d = 0.002 * (t - 1990) + rng.normal(0, 0.002, 30)
+    Q = np.zeros(6)
+    Q[tavgii], Q[davgii], Q[tsqii], Q[dtavgii], Q[dsqii], Q[sii] = t.sum(), d.sum(), (t * t).sum(), (d * t).sum(), (d * d).sum(), len(t)
+    free = base_regression(Q)
+    for slope in (1e-3, 2e-3, 2.0):
+        r = base_regression(Q, slope=slope)
+        res = lambda icpt: 0.5 * np.sum((d - slope * t - icpt) ** 2)
+        assert r['chisq'] == pytest.approx(res(r['intercept']), rel=1e-6)
+        assert res(r['intercept']) < min(res(r['intercept'] + 1e-4), res(r['intercept'] - 1e-4))
+        assert r['chisq'] >= free['chisq'] - 1e-12 and r['chisq'] != free['chisq']
+
+
 # --- root candidates -------------------------------------------------------------
 
 import copy  # noqa: E402
