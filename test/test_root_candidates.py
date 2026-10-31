@@ -413,3 +413,23 @@ def test_plots_render(b20, top, tmp_path):
     fig.savefig(tmp_path / 'p.png')
     plt.close(fig)
     assert (tmp_path / 'p.png').stat().st_size > 0
+
+
+def test_candidate_labels_do_not_depend_on_hash_seed():
+    """Node names (INT_xxxx) and candidate ids are deterministic across processes
+    with different PYTHONHASHSEED values (set/frozenset iteration order)."""
+    import subprocess
+    import sys
+    code = ("import sys; sys.path.insert(0, %r)\n"
+            "from test_root_candidates import load\n"
+            "from treetime.root_candidates import UnrootedBaseline, regression_candidates\n"
+            "nwk, aln, dates, _ = load('poly20')\n"
+            "b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')\n"
+            "print([(b.candidate_id(c), sorted(c.split)) for c in b.all_candidates()])\n"
+            "print([b.candidate_id(c) for c, _ in regression_candidates(b, 3)])\n") % os.path.dirname(os.path.abspath(__file__))
+    outs = []
+    for seed in ('0', '7', '12345'):
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        outs.append(subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True,
+                                   check=True).stdout)
+    assert outs[0] == outs[1] == outs[2] and outs[0].strip()
