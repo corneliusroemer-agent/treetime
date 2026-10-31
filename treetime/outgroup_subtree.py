@@ -276,12 +276,17 @@ class OutgroupSubtree:
         lengths; never returns a point worse than ``x0`` (default the current
         ``lengths``). ``starts``: extra initial points (lists of lengths).
         Returns (lengths, combined score)."""
-        from scipy.optimize import minimize, minimize_scalar
         G = self._groups(tt)
+        return self.maximise(lambda msg: self._value(G, msg), x0=x0, starts=starts)
+
+    def maximise(self, value, x0=None, starts=None):
+        """Outgroup lengths maximising ``value(pattern messages)`` (the optimiser of
+        :meth:`fit_lengths`). Returns (lengths, value)."""
+        from scipy.optimize import minimize, minimize_scalar
         lo, hi = np.log(self.bounds[0]), np.log(self.bounds[1])
 
         def f(x):
-            return -self._value(G, self.pattern_messages(np.exp(x)))
+            return -value(self.pattern_messages(np.exp(x)))
         x0 = np.log(np.clip(self.lengths if x0 is None else np.asarray(x0, dtype=float), *self.bounds))
         best_x, best_f = x0, f(x0)
         inits = [x0] + [np.log(np.clip(np.asarray(s, dtype=float), *self.bounds)) for s in (starts or [])]
@@ -333,14 +338,38 @@ class OutgroupEvaluator:
     lengths it was scored at in ``run.extra['outgroup_lengths']``. With
     ``fit_lengths=False`` the lengths stay at ``outgroup.lengths`` (fixed
     messages: Stage 2b).
+
+    ``attach_mixture_w`` = w > 0: the attachment mixture is part of the dated
+    fit. The outgroup attaches at the candidate root with probability 1 - w and
+    at the midpoint of one of its neighbouring edges with probability w, split
+    uniformly (:class:`AttachmentMixture`; outgroup lengths fitted per
+    attachment). Each round builds, at the current ingroup state, the
+    responsibilities of the attachments and the surrogate root-state message
+    (:meth:`AttachmentMixture.surrogate_messages`), runs the dated fit with it,
+    and scores the fitted state by the exact mixture log-likelihood with the
+    lengths refitted there; the candidate's score is the best such score. Rounds
+    continue (up to ``outer_iterations`` after round 0) while refitting the
+    lengths at the best state gains at least ``tol``, as for w = 0. The
+    trajectory ``scores`` are the surrogate's; ``run.extra`` holds the mixture
+    terms, responsibilities and per-attachment lengths, and
+    ``outgroup_lengths`` are those of the attachment at the root. The kept state
+    carries the plain message of that attachment. w = 0 is exactly the
+    unmixed evaluator.
     """
 
-    def __init__(self, outgroup, outer_iterations=2, tol=1e-2, fit_lengths=True):
+    def __init__(self, outgroup, outer_iterations=2, tol=1e-2, fit_lengths=True, attach_mixture_w=0.0):
         self.outgroup = outgroup
         self.outer_iterations, self.tol, self.fit = int(outer_iterations), float(tol), bool(fit_lengths)
+        self.w = float(attach_mixture_w)
+        if not 0.0 <= self.w <= 1.0:
+            raise ValueError('attach_mixture_w must be in [0, 1]')
+        if self.w > 0 and not self.fit:
+            raise ValueError('attach_mixture_w > 0 needs fit_lengths=True')
 
     def __call__(self, baseline, cand, fit=None, keep_state=True, catch_errors=False, clock_rate=None,
                  initial_state=None):
+        if self.w > 0:
+            return self._call_mixture(baseline, cand, fit, keep_state, catch_errors, clock_rate, initial_state)
         og = self.outgroup
         t0 = time.time()
         cand = baseline.canonical(cand)
@@ -381,6 +410,80 @@ class OutgroupEvaluator:
             out.extra = {'outgroup_lengths': best_len.tolist(), 'outgroup_edges': list(og.edge_names),
                          'outer_rounds': rounds, 'outer_rounds_performed': len(runs) - 1,
                          'outgroup_newick': og.newick(best_len)}
+            out.initial_fraction = None if initial_state is not None else getattr(cand, 'fraction', None)
+        except FIT_ERRORS as exc:
+            if not catch_errors:
+                raise
+            out = FitRun(candidate=cand, candidate_id=baseline.candidate_id(cand),
+                         initial_fraction=None if initial_state is not None else getattr(cand, 'fraction', None),
+                         initial_mode='warm' if initial_state is not None else (fit.initial_mode if fit else 'marginal'))
+            out.error = '%s: %s' % (type(exc).__name__, exc)
+            out.best_score = -np.inf
+        out.runtime = time.time() - t0
+        return out
+
+
+    def _mixture_round(self, baseline, cand, fit, clock_rate, state, mix_state):
+        """One dated fit under the surrogate message built at ``mix_state``
+        (dict: mix, lengths, values); returns (run, its mixture record)."""
+        og, w = self.outgroup, self.w
+        msg = mix_state['mix'].surrogate_messages(w, mix_state['lengths'], mix_state['values'])
+        b = baseline.with_root_state_messages(msg)
+        run = evaluate_root_candidate(b, cand, fit, keep_state=True, catch_errors=False, clock_rate=clock_rate,
+                                      initial_state=state)
+        mix = AttachmentMixture(run.state, og)
+        at_fit = mix.score(w, [mix.value(j, th) for j, th in enumerate(mix_state['lengths'])]) \
+            if mix.n_terms == mix_state['mix'].n_terms else -np.inf
+        lengths, values = mix.fit(term_starts=mix_state['lengths'] if mix.n_terms == mix_state['mix'].n_terms
+                                  else None, x0=mix_state['lengths'][0])
+        rec = {'mix': mix, 'lengths': lengths, 'values': values, 'score': mix.score(w, values),
+               'score_at_fit_lengths': at_fit, 'surrogate_best': run.best_score}
+        run.best_score = rec['score']
+        return run, rec
+
+    def _call_mixture(self, baseline, cand, fit, keep_state, catch_errors, clock_rate, initial_state):
+        og, w = self.outgroup, self.w
+        t0 = time.time()
+        cand = baseline.canonical(cand)
+        runs, rounds = [], []
+        try:
+            if initial_state is not None:
+                start = copy.deepcopy(initial_state)
+                start.set_root_state_messages(None)
+            else:
+                start = baseline.make_treeanc(baseline.rooted_phylo(cand), messages=False)
+            mix0 = AttachmentMixture(start, og)
+            lengths, values = mix0.fit(x0=og.lengths)
+            del start
+            st0 = {'mix': mix0, 'lengths': lengths, 'values': values}
+            run, rec = self._mixture_round(baseline, cand, fit, clock_rate, initial_state, st0)
+            runs.append(run)
+            rounds.append({'round': 0, 'pre_fit_score': mix0.score(w, values), 'best_score': rec['score'],
+                           'surrogate_best': rec['surrogate_best']})
+            best_run, best = run, rec
+            for k in range(self.outer_iterations):
+                gain = best['score'] - best['score_at_fit_lengths']
+                if gain < self.tol:
+                    rounds.append({'round': k + 1, 'best_score': None, 'stopped': 'gain %.3g < tol' % gain})
+                    break
+                run, rec = self._mixture_round(baseline, cand, fit, best_run.clock_rate, best_run.state, best)
+                runs.append(run)
+                rounds.append({'round': k + 1, 'pre_fit_score': best['score'], 'best_score': rec['score'],
+                               'surrogate_best': rec['surrogate_best']})
+                if rec['score'] > best_run.best_score:
+                    best_run, best = run, rec
+            # the kept state carries the plain message of the attachment at the root
+            best_run.state.set_root_state_messages(og.messages(best['lengths'][0]))
+            out = _merge_runs(runs, best_run, keep_state)
+            m = best['mix']
+            out.extra = {'outgroup_lengths': best['lengths'][0].tolist(), 'outgroup_edges': list(og.edge_names),
+                         'outer_rounds': rounds, 'outer_rounds_performed': len(runs) - 1,
+                         'outgroup_newick': og.newick(best['lengths'][0]), 'attach_mixture_w': w,
+                         'mixture_at_root': float(best['values'][0]),
+                         'mixture_neighbours': [float(v) for v in best['values'][1:]],
+                         'mixture_neighbour_edges': [nb['edge'] for nb in m.neighbours],
+                         'mixture_responsibilities': m.responsibilities(w, best['values']).tolist(),
+                         'mixture_lengths': [th.tolist() for th in best['lengths']]}
             out.initial_fraction = None if initial_state is not None else getattr(cand, 'fraction', None)
         except FIT_ERRORS as exc:
             if not catch_errors:
@@ -535,7 +638,7 @@ def _rows(stage1, stage3, outgroup, is_extra=False, baseline=None, mixture_ws=()
 
 def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, attachment='scan',
                                attach_k=3, extra_candidates=(), stage1=None, warm_start=True, outer_iterations=2,
-                               tol=1e-2, fit_lengths=True, mixture_ws=(), **rank_kwargs):
+                               tol=1e-2, fit_lengths=True, mixture_ws=(), attach_mixture_w=0.0, **rank_kwargs):
     """Stage 1 and Stage 3 (outgroup subtree, lengths fitted per candidate) on
     one candidate set.
 
@@ -559,6 +662,10 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
     ``Stage3Result.extra``, never in ``stage3.results``, and cannot change the
     selected root. An extra candidate already on the shortlist is reported with
     its shortlist fits.
+
+    ``attach_mixture_w``: attachment-mixture weight inside the Stage 3 dated
+    fit (:class:`OutgroupEvaluator`); 0 (default) is the unmixed Stage 3. The
+    Stage 3 scores are then mixture log-likelihoods, and so are ``combined_3``.
 
     ``mixture_ws``: attachment-mixture weights w scored post hoc
     (:func:`attachment_mixture_scores`) at each candidate's Stage 1 and Stage 3
@@ -584,7 +691,8 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
                                       **rank_kwargs)
     elif any(r.best_run is not None and r.best_run.error is None and r.best_run.state is None for r in stage1.results):
         raise ValueError('rank_with_outgroup_subtree: the given stage1 result kept no states')
-    ev = OutgroupEvaluator(outgroup, outer_iterations=outer_iterations, tol=tol, fit_lengths=fit_lengths)
+    ev = OutgroupEvaluator(outgroup, outer_iterations=outer_iterations, tol=tol, fit_lengths=fit_lengths,
+                           attach_mixture_w=attach_mixture_w)
     s3 = rank_root_candidates(baseline, explicit=explicit, regression_k=regression_k, keep_states=True,
                               warm_starts=_warm_from(stage1) if warm_start else None, evaluator=ev, **rank_kwargs)
     k1 = {candidate_key(r.candidate) for r in stage1.results}
@@ -620,6 +728,7 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
                     c['state'] = None
     config = {'outer_iterations': outer_iterations, 'tol': tol, 'fit_lengths': fit_lengths,
               'attach_k': attach_k, 'regression_k': regression_k, 'warm_start': warm_start, 'mixture_ws': mixture_ws,
+              'attach_mixture_w': float(attach_mixture_w),
               'outgroup_newick': outgroup.newick(), 'n_outgroup_patterns': outgroup.n_patterns}
     return Stage3Result(stage1, s3, rows, extra=extra_rows, scan=scan, config=config)
 
@@ -816,3 +925,141 @@ def attachment_mixture_scores(baseline, tt, outgroup, ws=(0.0, 0.1, 0.3), length
         else:
             out[w] = float(logsumexp([np.log1p(-w) + s_r] + [np.log(w / len(s_nb)) + s for s in s_nb]))
     return out, {'at_root': s_r, 'neighbours': s_nb, 'n_neighbours': len(s_nb)}
+
+
+class AttachmentMixture:
+    """Attachment mixture of one fitted ingroup state, by message transport.
+
+    For the state ``tt`` rooted at R, term 0 is the outgroup attached at R and
+    term j >= 1 the outgroup attached at the midpoint of the j-th neighbouring
+    edge (the edges of :func:`attachment_mixture_scores`: for R inside edge
+    (u, v), the other edges at u and v; for R at a node, its incident edges).
+    Each term is written as a root-state message at R,
+
+        m~_j(a) = P(ingroup, outgroup | R = a, attachment j) / P(ingroup | R = a),
+
+    computed from the state's subtree partials, so that
+    sum_sites log sum_a pi_a l(a) m~_j(a) is that term's joint likelihood
+    exactly at this state (no rerooted TreeAnc needed). For neighbour edge
+    (p, c) with c below p, X its midpoint, t its length and l_c the partials of
+    c: A(b) = sum_x P_bx(t/2) m(x) [P(t/2) l_c](x) and B(b) = [P(t) l_c](b) are
+    the edge's contributions to p with and without the outgroup at X; then
+    m~ = A / B if p = R, else m~ = [P(t_p) (l_p A / B)] / [P(t_p) l_p] with t_p
+    the root edge above p.
+
+    :meth:`fit` fits the outgroup lengths per term, :meth:`score` gives
+    log[(1 - w) L_0 + w mean_j L_j], and :meth:`surrogate_messages` the
+    root-state message that the dated fit uses under the mixture.
+    """
+
+    def __init__(self, tt, outgroup):
+        base = copy.deepcopy(tt)
+        base.set_root_state_messages(None)
+        self.og = outgroup
+        self.G = G = outgroup._groups(base)  # also runs the postorder pass
+        cp = np.asarray(base.data.full_to_compressed_sequence_map)
+        _, self.group_of_position = np.unique(np.stack([cp, outgroup.pattern_of_position]), axis=1,
+                                              return_inverse=True)
+        self.group_of_position = np.asarray(self.group_of_position).ravel()
+        E = base.gtr.expQt
+        root = base.tree.root
+        kids = list(root.clades)
+        if len(kids) == 2:  # root inside an edge: neighbours are the child edges of both root children
+            pairs = [(u, w) for u in kids for w in u.clades]
+        else:
+            pairs = [(root, w) for w in kids]
+        self.neighbours = []
+        for p, c in pairs:
+            t = float(base._branch_length_to_gtr(c))
+            lc = c.marginal_subtree_LH[G['c']]
+            nb = {'edge': (p.name, c.name), 'B': lc @ E(t), 'down': lc @ E(t / 2.0), 'up': E(t / 2.0)}
+            if p is not root:
+                tp = float(base._branch_length_to_gtr(p))
+                lp = p.marginal_subtree_LH[G['c']]
+                nb.update(lp=lp, Ep=E(tp), den=lp @ E(tp))
+            self.neighbours.append(nb)
+        self.n_terms = 1 + len(self.neighbours)
+
+    def _transport(self, j, pattern_msg):
+        m = pattern_msg[self.G['o']]
+        if j == 0:
+            return m
+        nb = self.neighbours[j - 1]
+        ratio = ((m * nb['down']) @ nb['up']) / nb['B']
+        if 'lp' not in nb:
+            return ratio
+        return ((nb['lp'] * ratio) @ nb['Ep']) / nb['den']
+
+    def site_messages(self, j, lengths):
+        """(groups, K) transported message of term j at outgroup lengths ``lengths``."""
+        return self._transport(j, self.og.pattern_messages(lengths))
+
+    def _group_value(self, mt):
+        G = self.G
+        return float(np.sum(G['n'] * (G['pref'] + np.log(np.sum(G['pi_l'] * mt, axis=1)))))
+
+    def value(self, j, lengths):
+        """Joint log-likelihood of term j at outgroup lengths ``lengths``."""
+        return self._group_value(self.site_messages(j, lengths))
+
+    def fit(self, x0=None, term_starts=None):
+        """Outgroup lengths fitted per term by ML. Term 0 starts from ``x0``
+        (default the outgroup's lengths), each neighbour from term 0's fit;
+        or ``term_starts``, one start per term (term 0's fit is then an extra
+        start for the neighbours). Never worse than the start. Returns
+        (lengths per term, values)."""
+        per_term = term_starts is not None and len(term_starts) == self.n_terms
+        lengths, values = [], []
+        for j in range(self.n_terms):
+            xj = term_starts[j] if per_term else (x0 if j == 0 else lengths[0])
+            more = [lengths[0]] if per_term and j > 0 else None
+            th, v = self.og.maximise(lambda msg, j=j: self._group_value(self._transport(j, msg)),
+                                     x0=xj, starts=more)
+            lengths.append(th)
+            values.append(v)
+        return lengths, values
+
+    def log_weights(self, w):
+        n = len(self.neighbours)
+        if not n or w == 0.0:
+            return np.array([0.0] + [-np.inf] * n)
+        if w == 1.0:
+            return np.array([-np.inf] + [np.log(1.0 / n)] * n)
+        return np.array([np.log1p(-w)] + [np.log(w / n)] * n)
+
+    def score(self, w, values):
+        """log[(1 - w) L_0 + w mean_j L_j] from the term values."""
+        from scipy.special import logsumexp
+        return float(logsumexp(self.log_weights(float(w)) + np.asarray(values, dtype=float)))
+
+    def responsibilities(self, w, values):
+        lw = self.log_weights(float(w)) + np.asarray(values, dtype=float)
+        return np.exp(lw - self.score(w, values))
+
+    def surrogate_messages(self, w, lengths, values):
+        """(full_length, K) root-state messages for the dated fit under the mixture.
+
+        mu(a) = sum_j r_j m~_j(a) l_in / l_j per site, with r_j the term
+        responsibilities at this state, l_j = sum_a pi_a l(a) m~_j(a) the
+        term's site likelihood and l_in = sum_a pi_a l(a) the ingroup's. At this state the combined log-likelihood with
+        mu equals the ingroup log-likelihood, and with the m~_j held fixed its
+        derivative in an ingroup branch length is sum_j r_j dl_j / l_j per site,
+        the derivative of the EM objective sum_j r_j log L_j, except that term
+        j's part is approximate for the branches of neighbour j's own edge,
+        the subtree below it and (root inside an edge) the root edge above it:
+        there the outgroup's pull is frozen at this state. So the dated fit with
+        mu is a first-order M-step weighted by the responsibilities, exact for
+        term 0 (the attachment at the root). The evaluator rebuilds mu at each
+        new state and scores every state by the exact mixture. With all
+        responsibility on term 0, mu is the plain Stage 3 message up to a
+        per-site constant."""
+        r = self.responsibilities(w, values)
+        l_in = np.sum(self.G['pi_l'], axis=1)
+        mu = 0.0
+        for j in range(self.n_terms):
+            if r[j] == 0.0:
+                continue
+            mt = self.site_messages(j, lengths[j])
+            lj = np.sum(self.G['pi_l'] * mt, axis=1)
+            mu = mu + r[j] * mt * (l_in / lj)[:, None]
+        return np.asarray(mu)[self.group_of_position]

@@ -450,3 +450,177 @@ def test_stage3_final_rate_refit_carries_the_outgroup_subtree():
     assert {x.name for x in st.tree.get_terminals()} == set(seqs)  # outgroups are messages, not dated leaves
     assert abs(o.combined_score(copy.deepcopy(st), lengths) - ref['refit_logL']) < 1e-8
     assert r.stage1.final_rate_refit['state'].root_state_message is None  # Stage 1's refit has no outgroup
+
+
+# --- attachment mixture inside the dated fit ---------------------------------------------------
+def _with_outgroup_clade(t, lengths):
+    s, i12, l3, l1, l2 = lengths
+    t.root.clades.append(Clade(branch_length=s, clades=[
+        Clade(branch_length=i12, clades=[Clade(branch_length=l1, name='O1'), Clade(branch_length=l2, name='O2')]),
+        Clade(branch_length=l3, name='O3')]))
+    return t
+
+
+def _brute_mixture_terms(fx, tt, term_lengths):
+    """Independent per-column Felsenstein of every attachment term: the outgroup clade at the state's root
+    (pulley: the state rerooted at its own root position) and at the midpoint of each neighbouring edge."""
+    from treetime.outgroup_subtree import _rooted_on_edge, _unrooted_from_state
+    adj, names, nb, root_edge = _unrooted_from_state(copy.deepcopy(tt))
+    if root_edge is not None:
+        t0 = _rooted_on_edge(adj, names, root_edge[0], root_edge[1], root_edge[2])
+    else:
+        t0 = copy.deepcopy(fx['tree'])
+    trees = [t0] + [_rooted_on_edge(adj, names, a, b_) for a, b_ in nb]
+    return [brute(fx, _with_outgroup_clade(t, th)) for t, th in zip(trees, term_lengths)]
+
+
+def test_attachment_mixture_transport_equals_full_tree(fx):
+    """Each transported term equals the rerooted-TreeAnc term of attachment_mixture_scores and an independent
+    full-tree Felsenstein; the surrogate message leaves the combined score equal to the ingroup score."""
+    from treetime.outgroup_subtree import AttachmentMixture, attachment_mixture_scores
+    o = og3(fx)
+    tt = copy.deepcopy(fx['tt'])
+    _, det = attachment_mixture_scores(fx['b'], tt, o, ws=(0.0,), lengths=LENGTHS3, fit=False)
+    m = AttachmentMixture(tt, o)
+    vals = [m.value(j, LENGTHS3) for j in range(m.n_terms)]
+    assert m.n_terms == 1 + det['n_neighbours'] >= 3
+    assert np.allclose(vals, [det['at_root']] + det['neighbours'], atol=1e-8, rtol=0)
+    assert np.allclose(vals, _brute_mixture_terms(fx, tt, [LENGTHS3] * m.n_terms), atol=1e-7, rtol=0)
+    # mixture formula and responsibilities
+    from scipy.special import logsumexp
+    n = m.n_terms - 1
+    assert abs(m.score(0.3, vals) - logsumexp([np.log(0.7) + vals[0]] + [np.log(0.3 / n) + v for v in vals[1:]])) < 1e-10
+    r = m.responsibilities(0.3, vals)
+    assert abs(r.sum() - 1) < 1e-12 and m.score(0.0, vals) == vals[0]
+    # surrogate: sum_a pi l(a) mu(a) = sum_a pi l(a) per site, so the combined score is the ingroup score
+    mu = m.surrogate_messages(0.3, [LENGTHS3] * m.n_terms, vals)
+    st = copy.deepcopy(tt)
+    st.set_root_state_messages(None)
+    ingroup = fresh_marginal_score(st)
+    st.set_root_state_messages(mu)
+    assert abs(fresh_marginal_score(st) - ingroup) < 1e-7
+    # all responsibility on the root term: the plain message up to a per-site constant
+    mu0 = m.surrogate_messages(0.0, [LENGTHS3] * m.n_terms, vals)
+    plain = o.messages(LENGTHS3)
+    ratio = mu0 / plain
+    assert np.allclose(ratio, ratio[:, :1], rtol=1e-9, atol=0)
+    # fitting the lengths per term never loses
+    lens, fvals = m.fit(x0=LENGTHS3)
+    assert all(f >= v - 1e-9 for f, v in zip(fvals, vals))
+    assert np.allclose(fvals, [m.value(j, th) for j, th in enumerate(lens)], atol=1e-10, rtol=0)
+
+
+@pytest.fixture(scope='module')
+def mixture_runs():
+    nwk, aln, dates, _ = load('binary20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    L = len(next(iter(seqs.values())))
+    ogs = _outgroups(seqs, L)
+    kw = dict(regression_k=3, attach_k=2, fit=FitConfig(iterations=2), outer_iterations=2)
+    nw = '((O1,O2),O3);'
+    plain = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs, tree=nw), **kw)
+    zero = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs, tree=nw), attach_mixture_w=0.0,
+                                      stage1=plain.stage1, **kw)
+    tiny = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs, tree=nw), attach_mixture_w=1e-6,
+                                      stage1=plain.stage1, **kw)
+    mixed = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs, tree=nw), attach_mixture_w=0.2,
+                                       stage1=plain.stage1, **kw)
+    fx_ = dict(b=b, seqs=seqs, L=L, ogs=ogs)
+    return fx_, plain, zero, tiny, mixed
+
+
+def test_attach_mixture_w0_is_stage3(mixture_runs):
+    _, plain, zero, _, _ = mixture_runs
+    key = lambda res: [(r.candidate_id, r.score, r.best_run.extra.get('outgroup_lengths')) for r in res.stage3.results]  # noqa: E731
+    assert key(zero) == key(plain)
+    assert all('attach_mixture_w' not in r.best_run.extra for r in zero.stage3.results)
+    assert zero.config['attach_mixture_w'] == 0.0
+
+
+def test_attach_mixture_small_w_matches_stage3_where_the_root_term_dominates(mixture_runs):
+    """With w -> 0 the surrogate is the Stage 3 message up to per-site constants: candidates whose
+    responsibility sits on the root attachment get the Stage 3 score back."""
+    _, plain, _, tiny, _ = mixture_runs
+    by0 = {r.candidate_id: r for r in plain.stage3.results}
+    checked = 0
+    for r in tiny.stage3.results:
+        e = r.best_run.extra
+        assert e['attach_mixture_w'] == 1e-6 and abs(sum(e['mixture_responsibilities']) - 1) < 1e-9
+        if e['mixture_responsibilities'][0] > 1 - 1e-6:
+            assert abs(r.score - by0[r.candidate_id].score) < 1e-3
+            checked += 1
+    assert checked >= 1
+
+
+def test_attach_mixture_score_is_the_direct_mixture_of_its_state(mixture_runs):
+    """The reported score of every candidate equals the mixture computed directly (independent Felsenstein
+    over uncompressed columns, one full tree per attachment) at its kept state and reported lengths."""
+    from scipy.special import logsumexp
+    fx_, _, _, _, mixed = mixture_runs
+    w = 0.2
+    for r in mixed.stage3.results[:2]:
+        st, e = r.best_run.state, r.best_run.extra
+        assert st.root_state_message is not None  # carries the plain message of the root attachment
+        fxs = dict(fx_, tt=st, tree=_clean_tree(st))
+        terms = _brute_mixture_terms(fxs, st, [np.asarray(x) for x in e['mixture_lengths']])
+        n = len(terms) - 1
+        direct = logsumexp([np.log1p(-w) + terms[0]] + [np.log(w / n) + t for t in terms[1:]])
+        assert abs(direct - r.score) < 1e-6
+        assert np.allclose(terms, [e['mixture_at_root']] + e['mixture_neighbours'], atol=1e-6, rtol=0)
+        assert e['outgroup_lengths'] == e['mixture_lengths'][0]
+    assert mixed.config['attach_mixture_w'] == w
+
+
+def _clean_tree(tt):
+    def clean(n_):
+        cl = Clade(name=n_.name if n_.is_terminal() else None, clades=[clean(x) for x in n_.clades])
+        if n_ is not tt.tree.root:
+            cl.branch_length = tt._branch_length_to_gtr(n_)
+        return cl
+    return Tree(root=clean(tt.tree.root), rooted=True)
+
+
+def test_attach_mixture_hand_checkable_star():
+    """Three ingroup leaves on a star rooted at the centre, one outgroup leaf, JC, two columns: the
+    mixture of the attachment at the centre and at the midpoint of each leaf edge, written out by hand."""
+    from scipy.linalg import expm
+    from treetime import GTR
+    from treetime.outgroup_subtree import AttachmentMixture
+    recs = [SeqRecord(Seq(s), id=k, description='') for k, s in (('A', 'AC'), ('B', 'AA'), ('C', 'GA'))]
+    gtr = GTR.standard('JC69', alphabet='nuc_nogap')
+    t = Tree(root=Clade(clades=[Clade(name='A', branch_length=0.1), Clade(name='B', branch_length=0.2),
+                                Clade(name='C', branch_length=0.3)]), rooted=True)
+    ta = TreeAnc(tree=t, aln=MultipleSeqAlignment(recs), gtr=gtr, verbose=0)
+    o = OutgroupSubtree(gtr, {'O': 'AG'})
+    d = 0.15
+    m = AttachmentMixture(ta, o)
+    vals = [m.value(j, np.array([d])) for j in range(m.n_terms)]
+    # by hand: P(t) = expm(Q t) with JC rate normalised to one substitution per unit time
+    Q = (np.ones((4, 4)) - 4 * np.eye(4)) / 3.0
+    P = lambda x: expm(Q * x)  # noqa: E731
+    idx = {c: i for i, c in enumerate('ACGT')}
+    leaves = {'A': ('AC', 0.1), 'B': ('AA', 0.2), 'C': ('GA', 0.3)}
+    pi = np.full(4, 0.25)
+
+    def col(i, at):
+        oc = idx['AG'[i]]
+        total = 0.0
+        for a in range(4):  # centre state
+            f = pi[a]
+            for name, (s, bl) in leaves.items():
+                x = idx[s[i]]
+                if name == at:  # outgroup at the midpoint X of this leaf edge
+                    f *= sum(P(bl / 2)[a, y] * P(d)[y, oc] * P(bl / 2)[y, x] for y in range(4))
+                else:
+                    f *= P(bl)[a, x]
+            if at is None:
+                f *= P(d)[a, oc]
+            total += f
+        return np.log(total)
+    expect = [col(0, None) + col(1, None)] + [col(0, k) + col(1, k) for k in ('A', 'B', 'C')]
+    assert m.n_terms == 4
+    assert np.allclose(sorted(vals[1:]), sorted(expect[1:]), atol=1e-10, rtol=0)
+    assert abs(vals[0] - expect[0]) < 1e-10
+    w = 0.3
+    assert abs(m.score(w, vals) - np.log(0.7 * np.exp(expect[0]) + 0.1 * sum(np.exp(expect[1:])))) < 1e-10
