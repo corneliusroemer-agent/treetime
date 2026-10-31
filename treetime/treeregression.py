@@ -318,6 +318,55 @@ class TreeRegression(object):
 
         return clock_model
 
+    def rank_roots(self, force_positive=True, slope=None):
+        """
+        Optimise the root position along every edge and rank the edges by
+        the regression objective.
+
+        Each edge is represented by the node below it. This is the search that
+        :py:meth:`find_best_root` uses; it returns every edge rather than only
+        the winner.
+
+        Parameters
+        ----------
+        force_positive : bool, optional
+            drop edges whose optimal regression has a negative slope
+        slope : float, optional
+            if given, the slope is fixed rather than optimised
+
+        Returns
+        -------
+        list of dict
+            one entry per edge with a finite objective, sorted by increasing
+            `edge_chisq`, the objective minimised along the edge (ties keep
+            tree traversal order). Each entry holds the node
+            below the edge (`node`), the fraction `split` of the edge length
+            between the root and that node, and the regression parameters.
+        """
+        self._calculate_averages()
+        ranked = []
+        for n in self.tree.find_clades():
+            if n == self.tree.root:
+                continue
+
+            tv = self.tip_value(n)
+            bv = self.branch_value(n)
+            var = self.branch_variance(n)
+            x, chisq = self._optimal_root_along_branch(n, tv, bv, var, slope=slope)
+            if not np.isfinite(chisq):
+                continue
+            tmpQ = self.propagate_averages(n, tv, bv * x, var * x) + self.propagate_averages(
+                n, tv, bv * (1 - x), var * (1 - x), outgroup=True
+            )
+            reg = base_regression(tmpQ, slope=slope)
+            if reg['slope'] >= 0 or (force_positive == False):
+                root = {'node': n, 'split': x, 'edge_chisq': chisq}
+                root.update(reg)
+                ranked.append(root)
+
+        ranked.sort(key=lambda r: r['edge_chisq'])
+        return ranked
+
     def find_best_root(self, force_positive=True, slope=None):
         """
         determine the position on the tree that minimizes the bilinear
@@ -329,24 +378,10 @@ class TreeRegression(object):
             dictionary with the node, the fraction `x` at which the branch
             is to be split, and the regression parameters
         """
-        self._calculate_averages()
         best_root = {'chisq': np.inf}
-        for n in self.tree.find_clades():
-            if n == self.tree.root:
-                continue
-
-            tv = self.tip_value(n)
-            bv = self.branch_value(n)
-            var = self.branch_variance(n)
-            x, chisq = self._optimal_root_along_branch(n, tv, bv, var, slope=slope)
-            if chisq < best_root['chisq']:
-                tmpQ = self.propagate_averages(n, tv, bv * x, var * x) + self.propagate_averages(
-                    n, tv, bv * (1 - x), var * (1 - x), outgroup=True
-                )
-                reg = base_regression(tmpQ, slope=slope)
-                if reg['slope'] >= 0 or (force_positive == False):
-                    best_root = {'node': n, 'split': x}
-                    best_root.update(reg)
+        for root in self.rank_roots(force_positive=force_positive, slope=slope):
+            best_root = root
+            break
 
         if 'node' not in best_root:
             print(f'TreeRegression.find_best_root: No valid root found! force_positive={force_positive}')
