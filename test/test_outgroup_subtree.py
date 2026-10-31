@@ -340,3 +340,22 @@ def test_extra_candidates_do_not_change_selection():
     new = next(x for x in r1.extra if x['source'] == 'extra')
     assert new['combined_3'] is not None and np.isfinite(new['combined_3'])
     assert b.candidate_id(b.canonical(off)) not in {r.candidate_id for r in r1.stage3.results}
+
+
+def test_reroot_invariance_end_to_end():
+    """Whole Stage 3 ranking (length fits, dated fits) with the outgroup tree written in two rootings."""
+    nwk, aln, dates, _ = load('binary20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    ogs = _outgroups(seqs, len(next(iter(seqs.values()))))
+    cands = b.all_candidates()[2:4]
+    out = []
+    for f in ('(((O1:0.008,O2:0.015):0.012,O3:0.02):0.01,ATTACH:0.02);',
+              '(O3:0.01,((O1:0.008,O2:0.015):0.012,ATTACH:0.03):0.01);'):
+        o = OutgroupSubtree(b.gtr, ogs, tree=f)
+        r = rank_with_outgroup_subtree(b, o, explicit=cands, regression_k=0, attachment=(), fit=FitConfig(iterations=1),
+                                       outer_iterations=1)
+        out.append({x.candidate_id: (x.score, x.best_run.extra['outgroup_lengths']) for x in r.stage3.results})
+    for k in out[0]:
+        assert abs(out[0][k][0] - out[1][k][0]) < 1e-8
+        assert np.allclose(out[0][k][1], out[1][k][1], rtol=1e-8)
