@@ -95,8 +95,7 @@ class UnrootedBaseline:
 
     def __init__(self, tree, aln, dates, gtr='JC69', clock_rate=None, optimize_baseline=True,
                  rng_seed=1234, covariation=False, tt_kwargs=None):
-        if isinstance(tree, str):
-            tree = Phylo.read(tree, 'newick')
+        tree = Phylo.read(tree, 'newick') if isinstance(tree, str) else copy.deepcopy(tree)
         self.aln = aln
         self.dates = dict(dates)
         self.gtr = gtr if isinstance(gtr, GTR) else GTR.standard(gtr)
@@ -121,18 +120,22 @@ class UnrootedBaseline:
     # -- construction --------------------------------------------------------
     def _from_phylo(self, tree, keep_names=False, allow_edge_root=False):
         adj = {}
-        counter = [0]
-        names = set(c.name for c in tree.find_clades() if c.name)
+        # internal labels from tree builders (support values etc.) need not be unique:
+        # replace them with fresh names unless the tree already carries our names
+        leaf_names = set(c.name for c in tree.get_terminals())
+        counter = 0
+        for c in tree.get_nonterminals(order='preorder'):
+            if keep_names and c.name:
+                continue
+            while 'INT_%04d' % counter in leaf_names:
+                counter += 1
+            c.name = 'INT_%04d' % counter
+            counter += 1
+        all_names = [c.name for c in tree.find_clades()]
+        if None in all_names or len(set(all_names)) != len(all_names):
+            raise ValueError('UnrootedBaseline: node names must be present and unique')
 
         def name_of(c):
-            if c.name is None or (not keep_names and not c.is_terminal() and c.name in ('', None)):
-                while True:
-                    nm = 'INT_%04d' % counter[0]
-                    counter[0] += 1
-                    if nm not in names:
-                        break
-                c.name = nm
-                names.add(nm)
             return c.name
 
         for c in tree.find_clades(order='preorder'):
