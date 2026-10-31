@@ -849,3 +849,134 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         'min_margin': min_margin,
     }
     return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config)
+
+
+# --------------------------------------------------------------------------
+# plots (matplotlib imported lazily)
+# --------------------------------------------------------------------------
+def _edge_split(baseline, a, b):
+    return baseline.split_of[a] if baseline.toward_ref.get(a) == b else baseline.split_of[b]
+
+
+def _placement_xy(baseline, tree, coords, cand):
+    """Plot position of a placement in a tree drawn by plot_root_candidates."""
+    cand = baseline.canonical(cand)
+    if isinstance(cand, NodeRoot):
+        return coords[baseline.node_of[cand.split]]
+    for c in tree.find_clades():
+        for ch in c.clades:
+            pa = c.name
+            if pa == EDGE_ROOT_NAME:  # the root splits one unrooted edge into two halves
+                pa = [x.name for x in c.clades if x is not ch][0]
+            if _edge_split(baseline, ch.name, pa) == cand.split:
+                (x0, _), (x1, y1) = coords[c.name], coords[ch.name]
+                return (0.5 * (x0 + x1), y1)
+    raise ValueError('placement not found')
+
+
+def plot_root_candidates(result, baseline, true_candidate=None, regression_candidate=None, ax=None,
+                         root_at=None, vmax=10.0, cmap='viridis', label_leaves=True):
+    """Draw the tree with every evaluated root placement coloured by its likelihood
+    deficit ΔlogL from the best (edges as coloured branches and midpoint squares,
+    node roots as coloured dots; placements not evaluated in grey).
+
+    The tree is drawn with the baseline branch lengths, rooted at ``root_at``
+    (default: the likelihood-best placement). Markers: likelihood best (star),
+    regression best (``regression_candidate`` or the result's regression rank 1;
+    triangle) and ``true_candidate`` if given (open circle). Returns the axes.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib import cm, colors
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, max(4, 0.16 * len(baseline.leaves))))
+    best = result.best.candidate
+    if regression_candidate is None and result.regression_best is not None:
+        regression_candidate = result.regression_best.candidate
+    tree = baseline.rooted_phylo(baseline.canonical(root_at or best))
+    delta = {candidate_key(r.candidate): r.delta_logL for r in result.results if r.delta_logL is not None}
+    norm = colors.Normalize(vmin=-vmax, vmax=0.0)
+    cmap = plt.get_cmap(cmap)
+
+    def col(key):
+        d = delta.get(key)
+        return cmap(norm(max(-vmax, d))) if d is not None else (0.75, 0.75, 0.75, 1.0)
+
+    coords, y = {}, [0]
+
+    def layout(c, x):
+        if c.is_terminal():
+            coords[c.name] = (x, y[0])
+            y[0] += 1
+        else:
+            ys = [layout(ch, x + (ch.branch_length or 0.0)) for ch in c.clades]
+            coords[c.name] = (x, 0.5 * (min(ys) + max(ys)))
+        return coords[c.name][1]
+    layout(tree.root, 0.0)
+
+    for c in tree.find_clades():
+        x0, y0 = coords[c.name]
+        if c.clades:
+            ys = [coords[ch.name][1] for ch in c.clades]
+            ax.plot([x0, x0], [min(ys), max(ys)], color='0.5', lw=0.8, zorder=1)
+        for ch in c.clades:
+            pa = c.name if c.name != EDGE_ROOT_NAME else [x.name for x in c.clades if x is not ch][0]
+            key = ('edge', _edge_split(baseline, ch.name, pa))
+            x1, y1 = coords[ch.name]
+            ax.plot([x0, x1], [y1, y1], color=col(key), lw=2.5 if key in delta else 0.8, zorder=2,
+                    solid_capstyle='butt')
+            if key in delta:
+                ax.scatter([0.5 * (x0 + x1)], [y1], marker='s', s=14, color=col(key), zorder=3, linewidths=0)
+        if c.clades and c.name != EDGE_ROOT_NAME:
+            key = ('node', baseline.split_of[c.name]) if c.name in baseline.split_of else None
+            if key in delta:
+                ax.scatter([x0], [y0], s=30, color=col(key), edgecolors='k', linewidths=0.4, zorder=4)
+        if label_leaves and c.is_terminal():
+            ax.text(x0, y0, ' ' + c.name, va='center', fontsize=6)
+
+    marks = [(best, '*', 'likelihood best', 160, 'tab:red'),
+             (regression_candidate, '^', 'regression best', 70, 'tab:orange'),
+             (true_candidate, 'o', 'true root', 120, 'k')]
+    for cand, m, lab, s, c in marks:
+        if cand is None:
+            continue
+        x, yy = _placement_xy(baseline, tree, coords, cand)
+        if m == 'o':
+            ax.scatter([x], [yy], marker=m, s=s, facecolors='none', edgecolors=c, linewidths=1.5, zorder=6,
+                       label=lab)
+        else:
+            ax.scatter([x], [yy], marker=m, s=s, color=c, edgecolors='k', linewidths=0.5, zorder=5, label=lab)
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+    ax.figure.colorbar(sm, ax=ax, fraction=0.04, pad=0.02, label='ΔlogL from best (clipped at -%g)' % vmax)
+    ax.set_yticks([])
+    ax.set_ylim(y[0], -1)
+    ax.set_xlabel('substitutions per site (baseline branch lengths)')
+    for s in ('top', 'right', 'left'):
+        ax.spines[s].set_visible(False)
+    ax.legend(loc='lower left', fontsize=7, frameon=False)
+    return ax
+
+
+def plot_root_to_tip(baseline, cand, ax=None, label=None):
+    """Root-to-tip distance (baseline branch lengths) against tip date with the
+    tree rooted at ``cand``, with the least-squares line; the regression view of
+    one root placement. Returns the axes."""
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(4, 3))
+    tree = baseline.rooted_phylo(baseline.canonical(cand))
+    depths = tree.depths()
+    leaves = [c for c in tree.get_terminals() if c.name in baseline.dates]
+    x = np.array([baseline.dates[c.name] for c in leaves])
+    y = np.array([depths[c] for c in leaves])
+    slope, icpt = np.polyfit(x, y, 1)
+    r2 = np.corrcoef(x, y)[0, 1] ** 2 if len(x) > 2 else np.nan
+    ax.scatter(x, y, s=12, color='tab:blue')
+    xx = np.array([min(x.min(), -icpt / slope if slope > 0 else x.min()), x.max()])
+    ax.plot(xx, slope * xx + icpt, color='k', lw=1)
+    ax.set_xlabel('date')
+    ax.set_ylabel('root-to-tip distance')
+    ax.set_title('%s\nrate %.2e, root %.1f, R² %.2f' % (label or baseline.candidate_id(baseline.canonical(cand)),
+                                                         slope, -icpt / slope if slope else np.nan, r2), fontsize=8)
+    return ax

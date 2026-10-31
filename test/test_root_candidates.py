@@ -335,3 +335,19 @@ def test_example_data():
     assert b.clock_rate > 0
     res = rank_root_candidates(b, regression_k=3, fit=FIT1, sensitivity_window=None, keep_states=False)
     assert len(res.results) == 3 and all(np.isfinite(r.score) for r in res.results)
+
+
+def test_plots_render(b20, top, tmp_path):
+    mpl = pytest.importorskip('matplotlib')
+    mpl.use('Agg')
+    import matplotlib.pyplot as plt
+    from treetime.root_candidates import plot_root_candidates, plot_root_to_tip
+
+    res = rank_root_candidates(b20, explicit=[b20.node(hub(b20))], regression_k=3, fit=FitConfig(0),
+                               sensitivity_window=None, keep_states=False)
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 5))
+    plot_root_candidates(res, b20, true_candidate=EdgeRoot(true_split('binary20', b20)), ax=a1)
+    plot_root_to_tip(b20, top, ax=a2)
+    fig.savefig(tmp_path / 'p.png')
+    plt.close(fig)
+    assert (tmp_path / 'p.png').stat().st_size > 0
