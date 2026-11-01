@@ -1879,7 +1879,8 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
 
 _LSDV_EXTRA = ('rate_se', 'se_rel', 'rate_ci', 'se_inflation', 'root_date_se', 'outliers', 'outlier_mode',
                'outlier_passes', 'outlier_clades', 'resolve', 'auto_r2', 'internal_b', 'first_pass', 'n_nodes',
-               'n_nodes_unresolved', 'xo_rates', 'first_pass_rate', 'resample')
+               'n_nodes_unresolved', 'xo_rates', 'first_pass_rate', 'resample', 'gls_rate', 'gls_root_date',
+               'rate_prior', 'prior_share', 'root_date_prior', 'root_date_prior_share', 'root_date_prior_t_ref')
 
 
 def _lsdv_extra(x, kwargs):

@@ -315,7 +315,7 @@ def _ls_durations(f, mu):
 LSDV_OPTIONS = dict(resolve='auto', resolve_auto_tips=1000, resolve_auto_r2=0.2,
                     outlier_z=4.5, outlier_mode='drop', outlier_rounds=5, outlier_clade_max=4, outlier_clade_z=4.5,
                     internal_b=0.0, first_pass='ls', se_inflation=2.0, resample=0, resample_q=0.2, seed=1,
-                    date_ranges='variance')
+                    date_ranges='variance', rate_prior=None, root_date_prior=None)
 """The lsdv options and their defaults (reports 107 and 111): ladder resolution, switching to the cross-fitted ladder
 when there are more than 1000 tips and the plain root-to-tip R^2 (after outlier dates are dropped) is below 0.2; LSD2's
 outlier rule at z = 4.5, iterated, in drop mode, with the clade extension (an internal branch with |z| > 4.5 above 2-4
@@ -371,6 +371,12 @@ def _check(o, opts):
         raise ValueError('lsdv: seed must be an integer')
     if not o['internal_b'] >= 0:
         raise ValueError('lsdv: internal_b must be >= 0')
+    for key in ('rate_prior', 'root_date_prior'):
+        p = o[key]
+        if p is not None and not (np.ndim(p) == 1 and len(p) == 2 and all(np.isfinite(float(x)) for x in p)
+                                  and float(p[1]) > 0 and (key == 'root_date_prior' or float(p[0]) > 0)):
+            raise ValueError('lsdv: %s must be None or a pair (%s, log-scale sd > 0)'
+                             % (key, 'median rate > 0' if key == 'rate_prior' else 'median root date'))
     if o['date_ranges'] not in ('variance', 'midpoint'):
         raise ValueError("lsdv: date_ranges must be 'variance' or 'midpoint'")
     if o['first_pass'] not in ('ls', 'lsd2'):
@@ -599,14 +605,154 @@ def ladder_resolve(f, mu, y_order=None):
     return _from_arrays(par, tip, date, y, name, dvar).preorder()
 
 
-def _lsdv_core(f, L, tip_slack, rate, rounds, internal_b=0.0, first_pass='ls', date_ranges=False):
+def plain_rate_with_prior(f, rate_prior):
+    """Plain root-to-tip slope combined with a rate prior (median mu0, log-scale sd S) as two Gaussian estimates on
+    the linear scale (so a non-positive slope still combines): prior sd mu0*S, slope SE from the OLS residuals,
+    sqrt(RSS/(n-2) / sum (t - tbar)^2), which ignores the shared-path covariance and so overstates the data's weight.
+    Returns (combined rate, plain slope, plain SE, prior share)."""
+    par, tip, date, y = _arrays(f)
+    n = len(par)
+    d = np.zeros(n)
+    for v in range(1, n):  # flat trees are in preorder
+        d[v] = d[par[v]] + y[v]
+    m = tip & np.isfinite(date)
+    t, yy = date[m], d[m]
+    X = np.c_[np.ones(len(t)), t]
+    beta, *_ = np.linalg.lstsq(X, yy, rcond=None)
+    rss = float(np.sum((yy - X @ beta) ** 2))
+    sxx = float(np.sum((t - t.mean()) ** 2))
+    se = np.sqrt(rss / max(len(t) - 2, 1) / sxx) if sxx > 0 else np.inf
+    mu0, S = rate_prior
+    wp = 1.0 / (mu0 * S) ** 2
+    wd = 1.0 / se ** 2 if se > 0 else np.inf
+    if not np.isfinite(wd):
+        return float(beta[1]), float(beta[1]), float(se), 0.0
+    b = (wd * beta[1] + wp * mu0) / (wd + wp)
+    return float(b), float(beta[1]), float(se), float(wp / (wd + wp))
+
+
+def _anchored_rate(f, date0):
+    """Slope of the root-to-tip distance on (date - date0) with the line through (date0, 0): the rate a root at date0
+    implies. Used as the reference rate when a root-date prior is given and the plain slope is not positive."""
+    par, tip, date, y = _arrays(f)
+    d = np.zeros(len(par))
+    for v in range(1, len(par)):
+        d[v] = d[par[v]] + y[v]
+    m = tip & np.isfinite(date)
+    dt = date[m] - date0
+    den = float(np.sum(dt * dt))
+    return float(np.sum(dt * d[m]) / den) if den > 0 else np.nan
+
+
+def _reference_rate(f, rate, rate_prior=None, root_date_prior=None):
+    """Reference rate of the durations and the ladder: ``rate`` if given; else the plain slope, combined with the rate
+    prior (:func:`plain_rate_with_prior`, falling back to the prior median when that is not positive); else, with a
+    root-date prior and a non-positive plain slope, :func:`_anchored_rate` at the prior median root date."""
+    if rate is not None:
+        return float(rate)
+    mu = _plain_regression(f)[0]
+    if rate_prior is not None:
+        mu = plain_rate_with_prior(f, rate_prior)[0]
+        if not mu > 0:
+            mu = float(rate_prior[0])
+    if root_date_prior is not None and not mu > 0:
+        mu = _anchored_rate(f, float(root_date_prior[0]))
+    return mu
+
+
+def _apply_rate_prior(reg, ml, var, r, rate_prior, k):
+    """Augmented-GLS pseudo-observation on the slope (report 113): minimise chisq(a, b) / k^2 + (b - mu0)^2 /
+    (2 sigma^2), sigma = mu0 S (the log-normal prior linearised at its median). TreeTime's chisq is half the weighted
+    residual sum of squares, so profiled over the intercept it is chisq_min + D (b - b_gls)^2 / 2 with D =
+    1/cov[0,0], and b* = (D b_gls + w mu0) / (D + w), w = k^2 / sigma^2; the intercept is refitted at b* by the
+    slope-fixed GLS. The k^2 (se_inflation) puts the prior on the same footing as the inflated SE that is reported.
+    Returns the slope-fixed regression dict with the posterior covariance inv(inv(cov) + diag(w, 0)), and the prior's
+    share of the slope precision."""
+    cov = np.asarray(r['cov'], float)
+    if not (cov[0, 0] > 0 and np.isfinite(cov[0, 0])):
+        return r, None
+    mu0, S = rate_prior
+    D = 1.0 / cov[0, 0]
+    wp = k * k / (mu0 * S) ** 2
+    b = (D * float(r['slope']) + wp * mu0) / (D + wp)
+    rf = reg.fit(ml, var, slope=b)
+    post = np.linalg.inv(np.linalg.inv(cov) + np.diag([wp, 0.0]))
+    return dict(rf, cov=post), float(wp / (D + wp))
+
+
+def _apply_priors_joint(r, rate_prior, root_date_prior, t_ref, k, b_start=None):
+    """Joint posterior mode of (slope b, intercept a) under the GLS likelihood, the rate prior of
+    :func:`_apply_rate_prior` (if given) and a LogNormal prior on the root age A = t_ref - root date (median t_ref -
+    date0, log-scale sd S_age). In chisq units the objective is
+    chisq_min + (theta - theta_gls)' H (theta - theta_gls) / 2 + k^2 [(b - mu0)^2 / (2 sigma^2)
+    + (log A - log A0)^2 / (2 S_age^2)], H = inv(cov), minimised over log b and log A (so the rate and the root age
+    stay positive), started from the GLS fit, the prior medians and ``b_start`` (the round's reference rate). The
+    covariance returned is the inverse Hessian of that objective in (b, a) at the mode (Gauss-Newton term of the age
+    prior, which is positive semi-definite), in the same units as the GLS cov (so the SE inflation applies). Returns
+    (regression-like dict with slope, intercept, chisq, cov; root-age prior share; rate prior share or None)."""
+    from scipy.optimize import minimize
+    cov = np.asarray(r['cov'], float)
+    H = np.linalg.inv(cov)
+    th0 = np.array([float(r['slope']), float(r['intercept'])])
+    date0, S_age = float(root_date_prior[0]), float(root_date_prior[1])
+    A0 = t_ref - date0
+    k2 = k * k
+    wr = k2 / (rate_prior[0] * rate_prior[1]) ** 2 if rate_prior is not None else 0.0
+    mu0 = rate_prior[0] if rate_prior is not None else 0.0
+
+    def obj(p):
+        b, A = np.exp(p[0]), np.exp(p[1])
+        d = np.array([b, b * (A - t_ref)]) - th0
+        return 0.5 * d @ H @ d + 0.5 * wr * (b - mu0) ** 2 + 0.5 * k2 * (p[1] - np.log(A0)) ** 2 / S_age ** 2
+
+    starts = []
+    if th0[0] > 0 and t_ref + th0[1] / th0[0] > 0:
+        starts.append((np.log(th0[0]), np.log(t_ref + th0[1] / th0[0])))  # the GLS fit
+    v = np.array([1.0, -date0])
+    b_anchor = float(v @ H @ th0 / (v @ H @ v))  # best line through the prior median root date
+    if b_anchor > 0:
+        starts.append((np.log(b_anchor), np.log(A0)))
+    if mu0 > 0:
+        starts.append((np.log(mu0), np.log(A0)))
+    if b_start is not None and b_start > 0 and np.isfinite(b_start):
+        starts.append((np.log(b_start), np.log(A0)))
+    if not starts:
+        raise ValueError('ls_dated_variance_rate: no positive starting rate for the root-date prior')
+    best = None
+    for lb, lA in starts:
+        res = minimize(obj, np.array([lb, lA]), method='Nelder-Mead',
+                       options=dict(xatol=1e-10, fatol=1e-12, maxiter=4000))
+        res = minimize(obj, res.x, method='BFGS', options=dict(gtol=1e-10))
+        if best is None or res.fun < best.fun:
+            best = res
+    b, A = float(np.exp(best.x[0])), float(np.exp(best.x[1]))
+    a = b * (A - t_ref)
+    d = np.array([b, a]) - th0
+    # Hessian in (b, a): data + rate prior + Gauss-Newton term of the age prior; g = log A, A = t_ref + a / b
+    grad_g = np.array([-a / b ** 2, 1.0 / b]) / A
+    Hage = k2 * np.outer(grad_g, grad_g) / S_age ** 2
+    Hpost = H + np.diag([wr, 0.0]) + Hage
+    post = np.linalg.inv(Hpost)
+    # prior shares: of the root-date precision (delta method on -a/b) and of the slope precision
+    gT = np.array([a / b ** 2, -1.0 / b])
+    prec_T_data = 1.0 / float(gT @ np.linalg.inv(H + np.diag([wr, 0.0])) @ gT)
+    prec_T_post = 1.0 / float(gT @ post @ gT)
+    age_share = float(1.0 - prec_T_data / prec_T_post) if prec_T_post > 0 else None
+    rate_share = float(wr / (1.0 / post[0, 0])) if wr else None
+    out = dict(r, slope=b, intercept=a, chisq=float(r['chisq'] + 0.5 * d @ H @ d), cov=post)
+    return out, age_share, rate_share
+
+
+def _lsdv_core(f, L, tip_slack, rate, rounds, internal_b=0.0, first_pass='ls', date_ranges=False, rate_prior=None,
+               root_date_prior=None, t_ref=None, k=2.0):
     """lsdv's fit on flat tree ``f`` (report 93), plus the opt-in internal smoothing constant and first pass.
     ``date_ranges``: a range date's variance (width^2 / 12, ``dvar``) is added to its tip's variance, in distance
-    units (times the round's reference rate squared). Returns (result dict, final variances, fitted regression
-    dict)."""
+    units (times the round's reference rate squared). ``rate_prior`` / ``root_date_prior``: applied to every round's
+    fit (:func:`_apply_rate_prior` alone, :func:`_apply_priors_joint` with a root-date prior), with the reference
+    rate of :func:`_reference_rate`. Returns (result dict, final variances, fitted regression dict)."""
     om = 1.0 / L
     plain_rate, plain_icpt, r_val = _plain_regression(f)
-    mu = plain_rate if rate is None else float(rate)
+    mu = _reference_rate(f, rate, rate_prior, root_date_prior)
     if not (mu > 0 and np.isfinite(mu)) and not (first_pass == 'lsd2' and int(rounds) <= 1):
         raise ValueError('ls_dated_variance_rate: reference rate not positive')
     tip = np.asarray(f.tip)
@@ -632,6 +778,12 @@ def _lsdv_core(f, L, tip_slack, rate, rounds, internal_b=0.0, first_pass='ls', d
             var = var + np.where(tip, mu_dur * mu_dur * dv, 0.0)
         var[0] = om * om
         r = reg.fit(ml, var)
+        if root_date_prior is not None:
+            gls = (float(r['slope']), float(r['intercept']))
+            r, age_share, prior_share = _apply_priors_joint(r, rate_prior, root_date_prior, t_ref, k, b_start=mu_dur)
+        elif rate_prior is not None:
+            gls = (float(r['slope']), float(r['intercept']))
+            r, prior_share = _apply_rate_prior(reg, ml, var, r, rate_prior, k)
         slope, icpt = float(r['slope']), float(r['intercept'])
         round_rates.append(slope)
         if not slope > 0:
@@ -642,6 +794,13 @@ def _lsdv_core(f, L, tip_slack, rate, rounds, internal_b=0.0, first_pass='ls', d
                round_rates=round_rates, n_nodes=len(f.par))
     if first_rate is not None:
         out['first_pass_rate'] = first_rate
+    if rate_prior is not None or root_date_prior is not None:
+        out.update(gls_rate=gls[0], gls_root_date=(-gls[1] / gls[0]) if gls[0] > 0 else None)
+    if rate_prior is not None:
+        out.update(rate_prior=[float(x) for x in rate_prior], prior_share=prior_share)
+    if root_date_prior is not None:
+        out.update(root_date_prior=[float(x) for x in root_date_prior], root_date_prior_share=age_share,
+                   root_date_prior_t_ref=float(t_ref))
     return out, var, r
 
 
@@ -660,18 +819,22 @@ def _se_fields(r, rate, icpt, k):
     return out
 
 
-def _fit_resolved(f, L, tip_slack, rate, rounds, internal_b, first_pass, method, seed, xo_reps=2, date_ranges=False):
-    """Resolution (None / 'ladder' / 'ladder_xo') + core fit. Returns (result, fitted flat tree, variances, reg)."""
+def _fit_resolved(f, L, tip_slack, rate, rounds, internal_b, first_pass, method, seed, xo_reps=2, date_ranges=False,
+                  rate_prior=None, root_date_prior=None, t_ref=None, k=2.0):
+    """Resolution (None / 'ladder' / 'ladder_xo') + core fit. Returns (result, fitted flat tree, variances, reg).
+    With a prior, the reference rate of the ladder ordering is :func:`_reference_rate`'s, and in ``ladder_xo`` each
+    member fit gets the prior (each member uses all the counts, so the prior is not counted twice in their geometric
+    mean)."""
+    pk = dict(rate_prior=rate_prior, root_date_prior=root_date_prior, t_ref=t_ref, k=k)
     if method is None:
-        out, var, r = _lsdv_core(f, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges)
+        out, var, r = _lsdv_core(f, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges, **pk)
         return out, f, var, r
-    plain_rate = _plain_regression(f)[0]
-    mu0 = plain_rate if rate is None else float(rate)
+    mu0 = _reference_rate(f, rate, rate_prior, root_date_prior)
     if not (mu0 > 0 and np.isfinite(mu0)):
         raise ValueError('ls_dated_variance_rate: reference rate not positive')
     if method == 'ladder':
         R = ladder_resolve(f, mu0)
-        out, var, r = _lsdv_core(R, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges)
+        out, var, r = _lsdv_core(R, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges, **pk)
         out.update(n_nodes_unresolved=len(f.par))
         return out, R, var, r
     # ladder_xo: order by a Poisson-thinned half, fit on all counts, both halves, xo_reps draws; geometric mean
@@ -682,11 +845,11 @@ def _fit_resolved(f, L, tip_slack, rate, rounds, internal_b, first_pass, method,
     for _ in range(xo_reps):
         k1 = rng.binomial(k, 0.5)
         for h in (2.0 * k1 / L, 2.0 * (k - k1) / L):
-            mu = _plain_regression(_with(f, ml=h))[0] if rate is None else float(rate)
+            mu = _reference_rate(_with(f, ml=h), rate, rate_prior, root_date_prior)
             if not mu > 0:
                 continue
             R = ladder_resolve(f, mu, y_order=h)
-            o, var, r = _lsdv_core(R, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges)
+            o, var, r = _lsdv_core(R, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges, **pk)
             if o['rate'] > 0:
                 fits.append((o, R, var, r))
     if not fits:
@@ -744,7 +907,7 @@ def _report93_like(o):
     """True when the effective options ``o`` give report 93's estimator (no resolution, outlier rule, internal b,
     LSD2 first pass or resampling)."""
     return (o['resolve'] is None and o['outlier_z'] is None and not o['internal_b'] and o['first_pass'] == 'ls'
-            and not o['resample'])
+            and not o['resample'] and o.get('rate_prior') is None and o.get('root_date_prior') is None)
 
 
 def lsdv_reports_extra(options):
@@ -764,6 +927,13 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
         raise ValueError('lsdv_flat: collapse and rate are not options here (collapse when flattening)')
     o = check_lsdv_options(options) if options else LSDV_OPTIONS
     ranges = o['date_ranges'] == 'variance'
+    t_ref = None
+    if o['root_date_prior'] is not None:
+        dd = np.asarray(f.date, float)[np.asarray(f.tip, bool)]
+        dd = dd[np.isfinite(dd)]
+        t_ref = float(dd.max()) if len(dd) else np.nan
+        if not t_ref > float(o['root_date_prior'][0]):
+            raise ValueError('lsdv: root_date_prior median must be earlier than the latest tip date')
     info = {}
     g = f
     if o['outlier_z'] is not None:
@@ -789,7 +959,8 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
             big = info['auto_r2'] < o['resolve_auto_r2']
         method = 'ladder_xo' if big else 'ladder'
     out, R, var, r = _fit_resolved(g, L, tip_slack, rate, rounds, o['internal_b'], o['first_pass'], method,
-                                   o['seed'], date_ranges=ranges)
+                                   o['seed'], date_ranges=ranges, rate_prior=o['rate_prior'],
+                                   root_date_prior=o['root_date_prior'], t_ref=t_ref, k=o['se_inflation'])
     out.update(_se_fields(r, out['rate'], out['intercept'], o['se_inflation']))
     if 'xo_rates' in out and r['slope'] > 0 and np.isfinite(out['rate_se']):
         # cross-fit: keep the member fit's relative SE around the geometric-mean rate
@@ -864,6 +1035,26 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
       ladder still needs a positive reference rate, so without one pass
       ``resolve=None`` as well.
     - ``se_inflation``: factor on the SE in ``rate_ci`` (2, reports 97/101/107).
+    - ``rate_prior``: None (default) or (mu0, S), a LogNormal prior on the
+      rate with median mu0 and log-scale sd S, entered as a pseudo-observation
+      on the slope of the GLS fit, linearised at the median and weighted
+      against the curvature of the SE-inflated fit (report 113). It also
+      stabilises the reference rate (plain slope combined with the prior),
+      so a non-positive plain slope no longer stops the fit. The outlier rule
+      runs before it and never sees it. Reported: ``rate_prior``,
+      ``prior_share`` (the prior's share of the slope precision),
+      ``gls_rate`` and ``gls_root_date`` (the fit without priors); ``cov``,
+      ``rate_se`` and ``root_date_se`` are posterior.
+    - ``root_date_prior``: None (default) or (date0, S_age), a LogNormal
+      prior on the root age A = t_ref - root date, t_ref the latest tip date
+      (before the outlier rule), with median t_ref - date0 and log-scale sd
+      S_age. Applied on the log scale, jointly with ``rate_prior`` when both
+      are given: the posterior mode over log rate and log A of the GLS
+      likelihood times the priors, so neither the rate nor the root age can
+      become negative; the covariance is the inverse Hessian at the mode
+      (Gauss-Newton term for the age prior). Reported:
+      ``root_date_prior``, ``root_date_prior_share`` (the prior's share of the
+      root-date precision), ``root_date_prior_t_ref``.
     - ``date_ranges``: how a tip date given as a range [lo, hi] (a month-only
       or year-only date, TreeTime's ``raw_date_constraint``) enters.
       'variance' (default): the regression uses the midpoint and adds the
