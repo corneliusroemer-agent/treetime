@@ -330,12 +330,15 @@ class UnrootedBaseline:
         other.root_state_messages = messages
         return other
 
-    def regression(self, covariation=False, tip_slack=None):
+    def regression(self, covariation=False, tip_slack=None, branch_variance_floor=None):
         """TreeRegression on the baseline branch lengths. ``tip_slack`` sets the
-        extra tip variance of the covariation model (TreeTime's default if None)."""
+        extra tip variance of the covariation model (TreeTime's default if None);
+        ``branch_variance_floor`` (mutations) adds variance to every branch
+        (:meth:`ClockTree.setup_TreeRegression`)."""
         tt = self.make_treetime(self.rooted_phylo(None), messages=False)
         if tip_slack is not None:
             tt.tip_slack = tip_slack
+        tt.branch_variance_floor = branch_variance_floor
         treg = tt.setup_TreeRegression(covariation=covariation)
         treg._tt = tt  # keep the node owner alive
         return treg
@@ -672,12 +675,13 @@ def restore_best_fitted_state(run):
 # --------------------------------------------------------------------------
 # candidate generation
 # --------------------------------------------------------------------------
-def _regression_edges(baseline, covariation=False, tip_slack=None, slope='fixed'):
+def _regression_edges(baseline, covariation=False, tip_slack=None, slope='fixed', branch_variance_floor=None):
     """Every edge the regression ranks (finite objective, positive slope), best
     first, as ``(edge split, fraction, rank_roots entry, objective at the edge
     midpoint)``. ``fraction`` follows :class:`EdgeRoot`'s convention."""
     from .treeregression import base_regression
-    treg = baseline.regression(covariation=covariation, tip_slack=tip_slack)
+    treg = baseline.regression(covariation=covariation, tip_slack=tip_slack,
+                               branch_variance_floor=branch_variance_floor)
     s = baseline.clock_rate if slope == 'fixed' else slope
     out = []
     for p in treg.rank_roots(force_positive=True, slope=s):
@@ -693,12 +697,15 @@ def _regression_edges(baseline, covariation=False, tip_slack=None, slope='fixed'
     return out
 
 
-def regression_candidates(baseline, k=5, covariation=False, tip_slack=None, slope='fixed'):
+def regression_candidates(baseline, k=5, covariation=False, tip_slack=None, slope='fixed',
+                          branch_variance_floor=None):
     """Best ``k`` distinct placements of the root-to-tip regression as canonical
     candidates, best first, each as ``(candidate, info)`` with the regression
     rank, objective and split. ``slope='fixed'`` uses the baseline clock rate;
-    ``None`` lets the regression fit its own slope."""
-    return _distinct_placements(baseline, _regression_edges(baseline, covariation, tip_slack, slope), k)
+    ``None`` lets the regression fit its own slope. ``branch_variance_floor``:
+    see :meth:`UnrootedBaseline.regression`."""
+    edges = _regression_edges(baseline, covariation, tip_slack, slope, branch_variance_floor)
+    return _distinct_placements(baseline, edges, k)
 
 
 def _distinct_placements(baseline, edges, k):
@@ -756,6 +763,7 @@ class RegressionSource:
     covariation: bool = False
     tip_slack: Optional[float] = None
     slope: object = 'fixed'
+    branch_variance_floor: Optional[float] = None  # covariation only: extra variance (mutations) on every branch
     node_edges: Optional[int] = 0  # per node candidate, add this many incident edges (None: all); label '<name>_adj'
     node_edges_max_rank: Optional[int] = None  # expand only node candidates ranked <= this (None: every one)
 
@@ -767,7 +775,8 @@ class RegressionSource:
         and ``[(edge candidate, rank of the node it expands)]`` from
         :func:`node_incident_edges` for each node candidate (empty when
         ``node_edges`` is 0)."""
-        edges = _regression_edges(baseline, self.covariation, self.tip_slack, self.slope)
+        edges = _regression_edges(baseline, self.covariation, self.tip_slack, self.slope,
+                                  self.branch_variance_floor)
         cands = _distinct_placements(baseline, edges, self.k)
         exp = []
         if self.node_edges is None or self.node_edges > 0:

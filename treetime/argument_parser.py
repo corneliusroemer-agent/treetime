@@ -188,6 +188,13 @@ def add_reroot_group(parser):
         action='store_true',
         help='Account for covariation when estimating rates or rerooting using root-to-tip regression, default False.',
     )
+    parser.add_argument(
+        '--branch-variance-floor',
+        type=float,
+        default=None,
+        help='with --covariation: extra variance, in mutations, added to every branch of the covariance model '
+        '(default: none). Keeps zero-length internal branches from getting zero variance.',
+    )
 
 
 def add_gtr_arguments(parser):

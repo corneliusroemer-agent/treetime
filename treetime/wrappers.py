@@ -427,6 +427,7 @@ def run_timetree(myTree, params, outdir, tree_suffix='', prune_short=True, metho
     infer_gtr = params.gtr == 'infer'
 
     myTree.tip_slack = params.tip_slack
+    myTree.branch_variance_floor = getattr(params, 'branch_variance_floor', None)
     if not myTree.one_mutation:
         print('TreeTime setup failed, exiting')
         return 1
@@ -968,6 +969,7 @@ def estimate_clock_model(params):
         raise e
 
     myTree.tip_slack = params.tip_slack
+    myTree.branch_variance_floor = getattr(params, 'branch_variance_floor', None)
     if params.clock_filter:
         n_bad = [n.name for n in myTree.tree.get_terminals() if n.bad_branch]
         myTree.clock_filter(

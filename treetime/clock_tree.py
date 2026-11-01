@@ -97,6 +97,8 @@ class ClockTree(TreeAnc):
         self._date2dist = None  # we do not know anything about the conversion
         self.tip_slack = ttconf.OVER_DISPERSION  # extra number of mutations added
         # to terminal branches in covariance calculation
+        self.branch_variance_floor = None  # if set, extra variance (in mutations) added to every
+        # branch in the covariation regression, as in LSD's (b + c/L)/L
         self.rel_tol_prune = ttconf.REL_TOL_PRUNE
         self.rel_tol_refine = ttconf.REL_TOL_REFINE
         self.branch_length_mode = branch_length_mode
@@ -264,7 +266,12 @@ class ClockTree(TreeAnc):
         Parameters
         ----------
         covariation : bool, optional
-            account for phylogenetic covariation
+            account for phylogenetic covariation. Each branch contributes
+            variance (length + floor*om [+ tip_slack^2*om on terminal branches])*om,
+            where om = one_mutation and floor = self.branch_variance_floor
+            (in mutations, default None = 0). The floor keeps zero-length internal
+            branches from getting zero variance and damps weights that lean on
+            small counts.
         Returns
         -------
         TreeRegression
@@ -276,10 +283,12 @@ class ClockTree(TreeAnc):
         branch_value = lambda x: x.mutation_length
         if covariation:
             om = self.one_mutation
+            floor = self.branch_variance_floor * om if self.branch_variance_floor else 0.0
             branch_variance = lambda x: (
                 (
                     (max(0, x.clock_length) if hasattr(x, 'clock_length') else x.mutation_length)
                     + (self.tip_slack**2 * om if x.is_terminal() else 0.0)
+                    + floor
                 )
                 * om
             )
