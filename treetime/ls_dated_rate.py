@@ -315,7 +315,7 @@ def _ls_durations(f, mu):
 LSDV_OPTIONS = dict(resolve='auto', resolve_auto_tips=1000, resolve_auto_r2=0.2,
                     outlier_z=4.5, outlier_mode='drop', outlier_rounds=5, outlier_clade_max=4, outlier_clade_z=4.5,
                     internal_b=0.0, first_pass='ls', se_inflation=2.0, resample=0, resample_q=0.2, seed=1,
-                    date_ranges='variance', rate_prior=None, root_date_prior=None)
+                    date_ranges='variance', rate_prior=None, root_date_prior=None, root_date_ci_factor=1.5)
 """The lsdv options and their defaults (reports 107 and 111): ladder resolution, switching to the cross-fitted ladder
 when there are more than 1000 tips and the plain root-to-tip R^2 (after outlier dates are dropped) is below 0.2; LSD2's
 outlier rule at z = 4.5, iterated, in drop mode, with the clade extension (an internal branch with |z| > 4.5 above 2-4
@@ -324,6 +324,11 @@ their uncertainty (``date_ranges='variance'``). z = 4.5 keeps the share of corre
 dated tips that are flagged at or below about 0.2% from 100 to 10,000 tips (z = 3 flags 1.5-3%) and still catches
 gross date errors. Every option can be overridden: :data:`LSDV_REPORT108` restores report 108's z = 3, and
 :data:`LSDV_REPORT93` turns the estimator back into report 93's."""
+
+DATE_SE_REL_MAX = 0.5
+"""``date_reliable`` is False when the rate's relative SE (``se_rel``, without SE inflation) exceeds this."""
+DATE_R2_MIN = 0.2
+"""``date_reliable`` is False when the plain root-to-tip R^2 (on the dates the fit uses) is below this."""
 
 LSDV_REPORT108 = dict(outlier_z=3.0, outlier_clade_z=3.0)
 """Options that give report 108's defaults (outlier rule and clade extension at z = 3) on top of the current ones."""
@@ -377,6 +382,8 @@ def _check(o, opts):
                                   and float(p[1]) > 0 and (key == 'root_date_prior' or float(p[0]) > 0)):
             raise ValueError('lsdv: %s must be None or a pair (%s, log-scale sd > 0)'
                              % (key, 'median rate > 0' if key == 'rate_prior' else 'median root date'))
+    if not o['root_date_ci_factor'] > 0:
+        raise ValueError('lsdv: root_date_ci_factor must be > 0')
     if o['date_ranges'] not in ('variance', 'midpoint'):
         raise ValueError("lsdv: date_ranges must be 'variance' or 'midpoint'")
     if o['first_pass'] not in ('ls', 'lsd2'):
@@ -903,6 +910,25 @@ def _resample_interval(R, L, var, out, refit, n, q, seed):
     return res
 
 
+def _date_fields(out, factor):
+    """Root-date interval and the don't-date flag of a fit (report 114): ``root_date_ci`` = root date +- 1.96 x
+    ``factor`` x root_date_se; ``r2`` = plain root-to-tip R^2 on the dates the fit uses (after the outlier rule);
+    ``date_reliable`` False when se_rel > DATE_SE_REL_MAX, r2 < DATE_R2_MIN or the rate is not positive, with the
+    reasons in ``date_flags``."""
+    r2 = float(out['r_val'] ** 2) if np.isfinite(out['r_val']) else float('nan')
+    ok = out['rate'] > 0 and out.get('root_date_se') is not None and np.isfinite(out['root_date_se'])
+    h = 1.96 * factor * out['root_date_se'] if ok else None
+    flags = []
+    if not out['rate'] > 0:
+        flags.append('rate not positive')
+    elif out.get('se_rel') is None or not out['se_rel'] <= DATE_SE_REL_MAX:
+        flags.append('se_rel > %g' % DATE_SE_REL_MAX)
+    if not r2 >= DATE_R2_MIN:
+        flags.append('r2 < %g' % DATE_R2_MIN)
+    return dict(root_date_ci=[out['root_date'] - h, out['root_date'] + h] if ok else None,
+                root_date_ci_factor=float(factor), r2=r2, date_reliable=not flags, date_flags=flags)
+
+
 def _report93_like(o):
     """True when the effective options ``o`` give report 93's estimator (no resolution, outlier rule, internal b,
     LSD2 first pass or resampling)."""
@@ -968,6 +994,7 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
         out['se_rel'] = float(out['rate_se'] / out['rate'])
         h = 1.96 * o['se_inflation'] * out['rate_se'] / out['rate']
         out['rate_ci'] = [out['rate'] * float(np.exp(-h)), out['rate'] * float(np.exp(h))]
+    out.update(_date_fields(out, o['root_date_ci_factor']))
     if lsdv_reports_extra(options):
         out.update(info, resolve=method, internal_b=float(o['internal_b']), first_pass=o['first_pass'])
         if o['resample'] and out['rate'] > 0:
@@ -1055,6 +1082,12 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
       (Gauss-Newton term for the age prior). Reported:
       ``root_date_prior``, ``root_date_prior_share`` (the prior's share of the
       root-date precision), ``root_date_prior_t_ref``.
+    - ``root_date_ci_factor``: factor k of the root-date interval
+      ``root_date_ci`` = root_date +- 1.96 x k x root_date_se (1.5). The
+      delta-method SE alone under-covers; report 114 found that 95% coverage
+      at the true root needs k of about 1.4 at 80 tips, 1.55-1.6 at 100-1000
+      tips and about 2.2 at 10,000 tips, so 1.5 under-covers on large trees.
+      ``root_date_se`` itself is reported unscaled.
     - ``date_ranges``: how a tip date given as a range [lo, hi] (a month-only
       or year-only date, TreeTime's ``raw_date_constraint``) enters.
       'variance' (default): the regression uses the midpoint and adds the
@@ -1066,6 +1099,15 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
     - ``resample``: number of LSD2-style resampling replicates (0 = off) for
       ``resample['rate_ci']`` and ``resample['root_date_ci']``; ``resample_q``
       the lognormal SD (0.2); ``seed`` for the resampling and the cross-fit.
+
+    Every fit reports ``root_date_ci``, ``root_date_ci_factor``, ``r2`` (plain
+    root-to-tip R^2 on the dates used) and the don't-date flag
+    ``date_reliable``: False when ``se_rel`` > 0.5 (DATE_SE_REL_MAX), ``r2`` <
+    0.2 (DATE_R2_MIN) or the rate is not positive, with the reasons in
+    ``date_flags`` (report 114: these flags pick out the large weak-signal
+    trees whose dates are hopeless, but cannot catch a narrow interval around
+    a wrong date; with a prior, ``se_rel`` is the posterior one, so prior
+    information can make a date reliable).
 
     Every fit reports the option fields above plus ``resolve`` (the method
     used), ``internal_b`` and ``first_pass``, except report 93's estimator

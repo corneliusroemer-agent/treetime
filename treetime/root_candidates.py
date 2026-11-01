@@ -1263,6 +1263,18 @@ class RootSearchResult:
         return b.root.get('root_date') if b is not None and b.error is None else None
 
     @property
+    def headline_root_date_ci(self):
+        """Interval of the headline root date (lsdv's ``root_date_ci``, root date +- 1.96 x 1.5 x root_date_se by
+        default) when the headline is 'final_lsdv' and the fit reports it, else None."""
+        return self.final_lsdv.get('root_date_ci') if self.headline_source == 'final_lsdv' else None
+
+    @property
+    def date_reliable(self):
+        """lsdv's don't-date flag at the winner (False when se_rel > 0.5 or the plain root-to-tip R^2 < 0.2) when
+        the headline is 'final_lsdv' and the fit reports it, else None."""
+        return self.final_lsdv.get('date_reliable') if self.headline_source == 'final_lsdv' else None
+
+    @property
     def headline_clock_rate(self):
         src = self.headline_source
         if src == 'final_lsdv':
@@ -1297,7 +1309,8 @@ class RootSearchResult:
         if self.final_lsdv is not None:
             out['final_lsdv'] = dict(self.final_lsdv)
             out.update({'headline_root_date': self.headline_root_date, 'headline_clock_rate': self.headline_clock_rate,
-                        'headline_source': self.headline_source})
+                        'headline_source': self.headline_source, 'headline_root_date_ci': self.headline_root_date_ci,
+                        'date_reliable': self.date_reliable})
         sri = self.config.get('shared_rate_info')
         if sri is not None:
             out['shared_rate_source'] = sri['source'] if not sri.get('fallback') else 'regression (lsdv fallback)'
@@ -1880,7 +1893,8 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
 _LSDV_EXTRA = ('rate_se', 'se_rel', 'rate_ci', 'se_inflation', 'root_date_se', 'outliers', 'outlier_mode',
                'outlier_passes', 'outlier_clades', 'resolve', 'auto_r2', 'internal_b', 'first_pass', 'n_nodes',
                'n_nodes_unresolved', 'xo_rates', 'first_pass_rate', 'resample', 'gls_rate', 'gls_root_date',
-               'rate_prior', 'prior_share', 'root_date_prior', 'root_date_prior_share', 'root_date_prior_t_ref')
+               'rate_prior', 'prior_share', 'root_date_prior', 'root_date_prior_share', 'root_date_prior_t_ref',
+               'root_date_ci', 'root_date_ci_factor', 'r2', 'date_reliable', 'date_flags')
 
 
 def _lsdv_extra(x, kwargs):

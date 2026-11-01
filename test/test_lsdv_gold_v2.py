@@ -184,3 +184,43 @@ def test_planted_year_only_tip(seed):
 def test_date_ranges_option_checked():
     with pytest.raises(ValueError):
         ld.lsdv_flat(flat(40, seed=2), L, date_ranges='exact')
+
+
+# ---- root-date interval and don't-date flag -----------------------------------------------------------------------
+def test_root_date_interval_and_flag():
+    f = flat(80, seed=2)
+    r = ld.lsdv_flat(f, L)
+    h = 1.96 * 1.5 * r['root_date_se']
+    assert r['root_date_ci'] == pytest.approx([r['root_date'] - h, r['root_date'] + h])
+    assert r['root_date_ci_factor'] == 1.5 and r['r2'] == pytest.approx(r['r_val'] ** 2)
+    assert r['date_reliable'] is True and r['date_flags'] == []
+    k2 = ld.lsdv_flat(f, L, root_date_ci_factor=2.2)
+    assert k2['root_date_ci'][1] - k2['root_date_ci'][0] == pytest.approx(2.2 / 1.5 * 2 * h)
+    assert k2['rate'] == r['rate'] and k2['root_date_se'] == r['root_date_se']
+    with pytest.raises(ValueError):
+        ld.lsdv_flat(f, L, root_date_ci_factor=0)
+
+
+def test_date_flag_on_weak_signal():
+    f = big_flat(1001, 3, shuffle=True)
+    r = ld.lsdv_flat(f, L)
+    assert r['date_reliable'] is False and any(x.startswith('r2') or x.startswith('se_rel') or x.startswith('rate')
+                                               for x in r['date_flags'])
+    assert ld._date_fields(dict(r, se_rel=0.6, r_val=0.9), 1.5)['date_flags'] == ['se_rel > 0.5']
+    assert ld._date_fields(dict(r, se_rel=0.1, r_val=0.4), 1.5)['date_flags'] == ['r2 < 0.2']
+
+
+def test_interval_and_flag_reach_the_headline():
+    from test_lsdv import FIT1
+    from treetime.root_candidates import plain_candidate_sources, rank_root_candidates
+    b = _b()
+    res = rank_root_candidates(b, regression_k=2, fit=FIT1, keep_states=False,
+                               candidate_sources=plain_candidate_sources(2))
+    fl = res.final_lsdv
+    assert res.headline_root_date_ci == fl['root_date_ci'] and len(fl['root_date_ci']) == 2
+    assert res.date_reliable == fl['date_reliable'] and 'date_reliable' in b.shared_rate_info['candidates'][0]
+    s = res.summary()
+    assert s['headline_root_date_ci'] == fl['root_date_ci'] and s['date_reliable'] == fl['date_reliable']
+    off = rank_root_candidates(b, regression_k=2, fit=FIT1, keep_states=False, final_lsdv=False,
+                               candidate_sources=plain_candidate_sources(2))
+    assert off.headline_root_date_ci is None and off.date_reliable is None
