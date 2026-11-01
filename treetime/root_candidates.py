@@ -134,7 +134,12 @@ class UnrootedBaseline:
         Number of regression placements for ``shared_rate='lsdv'``.
     shared_rate_kwargs : dict, optional
         Options of the lsdv rate (``tip_slack``, default 3; ``rounds``,
-        default 1; ``collapse``, default True).
+        default 1; ``collapse``, default True), plus the opt-in variants of
+        :data:`treetime.ls_dated_rate.LSDV_OPTIONS` (``resolve``,
+        ``outlier_z``, ``outlier_mode``, ``internal_b``, ``first_pass``,
+        ``se_inflation``, ``resample``, ...). Each per-placement row of
+        ``shared_rate_info['candidates']`` carries the SE (``rate_se``,
+        ``rate_ci``) and the variant's report fields (e.g. ``outliers``).
 
     The shared rate also sets the slope of the plain regression source
     (``RegressionSource(slope='fixed')``, in the default Stage 1 shortlist),
@@ -391,26 +396,32 @@ class UnrootedBaseline:
         d = float(np.mean(d))
         return d if np.isfinite(d) else np.nan
 
-    def lsdv(self, cand, tip_slack=3.0, rounds=1, collapse=True, rate=None):
+    def lsdv(self, cand, tip_slack=3.0, rounds=1, collapse=True, rate=None, **options):
         """lsdv rate at root placement ``cand`` on the baseline branch lengths:
         :func:`treetime.ls_dated_rate.lsdv_flat` on the rooted tree, equal to
         :func:`~treetime.ls_dated_rate.ls_dated_variance_rate` on a TreeTime
-        object rooted there. Raises ``ValueError`` when the plain root-to-tip
-        rate at ``cand`` (the reference rate unless ``rate`` is given) is not
-        positive."""
+        object rooted there. ``options``: the opt-in lsdv variants
+        (``resolve``, ``outlier_z``, ``internal_b``, ``se_inflation``,
+        ``resample``, ...; :data:`treetime.ls_dated_rate.LSDV_OPTIONS`). Raises
+        ``ValueError`` when the plain root-to-tip rate at ``cand`` (the
+        reference rate unless ``rate`` is given) is not positive."""
         from .ls_dated_rate import _flatten, lsdv_flat
         L = self.full_length
         f = _flatten(self.rooted_phylo(self.canonical(cand)), 1.0 / L, collapse=collapse,
                      length=lambda n: n.branch_length, date=self._tip_date)
-        return lsdv_flat(f, L, tip_slack=tip_slack, rate=rate, rounds=rounds)
+        return lsdv_flat(f, L, tip_slack=tip_slack, rate=rate, rounds=rounds, **options)
 
     def _lsdv_shared_rate(self, regression_rate, k, kwargs):
         """Median lsdv rate over the top ``k`` free-slope plain regression placements."""
         t0 = time.time()
         if not (isinstance(k, int) and k >= 1):
             raise ValueError('UnrootedBaseline: shared_rate_k must be a positive integer')
-        bad = set(kwargs) - {'tip_slack', 'rounds', 'collapse'}
-        if bad or kwargs.get('tip_slack', 3.0) < 0 or kwargs.get('rounds', 1) < 1:
+        from .ls_dated_rate import check_lsdv_options
+        try:
+            if 'rate' in kwargs:
+                raise ValueError('rate')
+            check_lsdv_options(kwargs)
+        except ValueError:
             raise ValueError('UnrootedBaseline: invalid shared_rate_kwargs %s' % kwargs)
         rows = []
         for cand, info in regression_candidates(self, k=k, covariation=False, slope=None):
@@ -420,6 +431,7 @@ class UnrootedBaseline:
                 r = self.lsdv(cand, **kwargs)
                 row.update(lsdv_rate=r['rate'], plain_rate=r['plain_rate'],
                            root_date=r['root_date'] if r['rate'] > 0 else None)
+                row.update(_lsdv_extra(r))
                 if not r['rate'] > 0:
                     row['error'] = 'lsdv rate not positive'
             except (ValueError, FloatingPointError, ZeroDivisionError) as e:
@@ -1813,11 +1825,23 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     lsdv_out = None
     if final_lsdv:
         lkw = dict(final_lsdv) if isinstance(final_lsdv, dict) else {}
+        from .ls_dated_rate import check_lsdv_options
+        check_lsdv_options(lkw)
         config['final_lsdv'] = lkw
         if results:
             lsdv_out = _final_lsdv(baseline, results[0], lkw)
     return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config,
                             final_rate_refit=refit, final_lsdv=lsdv_out)
+
+
+_LSDV_EXTRA = ('rate_se', 'rate_ci', 'se_inflation', 'root_date_se', 'outliers', 'outlier_mode', 'outlier_passes',
+               'resolve', 'internal_b', 'first_pass', 'n_nodes', 'n_nodes_unresolved', 'xo_rates', 'first_pass_rate',
+               'resample')
+
+
+def _lsdv_extra(x):
+    """The SE and opt-in fields of an lsdv result (ls_dated_rate.lsdv_flat) that are reported alongside its rate."""
+    return {k: x[k] for k in _LSDV_EXTRA if k in x}
 
 
 def _final_lsdv(baseline, r, kwargs):
@@ -1830,6 +1854,7 @@ def _final_lsdv(baseline, r, kwargs):
         x = baseline.lsdv(cand, **kwargs)
         out.update(rate=x['rate'], root_date=x['root_date'] if x['rate'] > 0 else None,
                    plain_rate=x['plain_rate'], intercept=x['intercept'], chisq=x['chisq'])
+        out.update(_lsdv_extra(x))
         if not x['rate'] > 0:
             out['error'] = 'lsdv rate not positive'
     except (ValueError, FloatingPointError, ZeroDivisionError) as e:
