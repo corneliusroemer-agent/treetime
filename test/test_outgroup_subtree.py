@@ -624,3 +624,65 @@ def test_attach_mixture_hand_checkable_star():
     assert abs(vals[0] - expect[0]) < 1e-10
     w = 0.3
     assert abs(m.score(w, vals) - np.log(0.7 * np.exp(expect[0]) + 0.1 * sum(np.exp(expect[1:])))) < 1e-10
+
+
+@pytest.mark.parametrize('case', ['edge', 'collapsed'])
+def test_attachment_mixture_transport_edge_and_collapsed_roots(case):
+    """Transport on edge-rooted states, including a fit that collapsed onto a node (poly20, edge L17-INT_0005):
+    terms equal the rerooted-TreeAnc terms and an independent Felsenstein; a collapsed root has its node's
+    neighbours, so it scores like the node-rooted fit of the same tree."""
+    from treetime.outgroup_subtree import AttachmentMixture, attachment_mixture_scores
+    nwk, aln, dates, _ = load('poly20')
+    b = UnrootedBaseline(nwk, aln, dates, gtr='JC69')
+    seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
+    L = len(next(iter(seqs.values())))
+    cand = b.edge('L17', 0.5, 'INT_0005') if case == 'collapsed' else b.edge('INT_0004', 0.5)
+    tt = evaluate_root_candidate(b, cand, FitConfig(iterations=2)).state
+    kids = tt.tree.root.clades
+    assert len(kids) == 2
+    collapsed = min(c.branch_length for c in kids) * L <= 0.05
+    assert collapsed == (case == 'collapsed')
+    fxs = dict(b=b, tt=tt, seqs=seqs, L=L, ogs=_outgroups(seqs, L))
+    fxs['tree'] = _clean_tree(tt)
+    o = og3(fxs)
+    _, det = attachment_mixture_scores(b, tt, o, ws=(0.0,), lengths=LENGTHS3, fit=False)
+    m = AttachmentMixture(tt, o)
+    vals = [m.value(j, LENGTHS3) for j in range(m.n_terms)]
+    assert np.allclose(vals, [det['at_root']] + det['neighbours'], atol=1e-8, rtol=0)
+    assert np.allclose(vals, _brute_mixture_terms(fxs, tt, [LENGTHS3] * m.n_terms), atol=1e-7, rtol=0)
+    if collapsed:  # same neighbour set as the node-rooted fit of INT_0005
+        tn = evaluate_root_candidate(b, b.node('INT_0005'), FitConfig(iterations=2)).state
+        assert AttachmentMixture(tn, o).n_terms == m.n_terms
+
+
+def test_surrogate_message_is_responsibility_weighted(fx):
+    from scipy.special import logsumexp
+    from treetime.outgroup_subtree import AttachmentMixture
+    o = og3(fx)
+    m = AttachmentMixture(copy.deepcopy(fx['tt']), o)
+    lens = [LENGTHS3 * (1 + 0.3 * j) for j in range(m.n_terms)]
+    vals = [m.value(j, th) for j, th in enumerate(lens)]
+    w, n = 0.3, m.n_terms - 1
+    lw = np.array([np.log1p(-w)] + [np.log(w / n)] * n) + np.array(vals)
+    r = np.exp(lw - logsumexp(lw))
+    assert np.allclose(m.responsibilities(w, vals), r, atol=1e-12)
+    l_in = np.sum(m.G['pi_l'], axis=1)
+    expect = sum(r[j] * m.site_messages(j, lens[j]) * (l_in / np.sum(m.G['pi_l'] * m.site_messages(j, lens[j]), axis=1))[:, None]
+                 for j in range(m.n_terms))
+    assert np.allclose(m.surrogate_messages(w, lens, vals), expect[m.group_of_position], rtol=1e-12, atol=0)
+
+
+def test_attach_mixture_never_below_posthoc_start_and_keeps_plain_message(mixture_runs):
+    """Each candidate's in-fit score is at least the post-hoc mixture of its Stage 1 state (the warm start), and
+    the kept state carries the plain message of the root attachment (its fresh combined score is that term)."""
+    from treetime.outgroup_subtree import AttachmentMixture
+    fx_, plain, _, _, mixed = mixture_runs
+    s1 = {r.candidate_id: r for r in mixed.stage1.results}
+    og = OutgroupSubtree(fx_['b'].gtr, fx_['ogs'], tree='((O1,O2),O3);')
+    for r in mixed.stage3.results:
+        st1 = s1[r.candidate_id].best_run.state
+        m = AttachmentMixture(st1, og)
+        lens, vals = m.fit(term_starts=[np.asarray(x) for x in r.best_run.extra['mixture_lengths']])
+        assert r.score >= m.score(0.2, vals) - 1e-3
+        st = copy.deepcopy(r.best_run.state)
+        assert abs(fresh_marginal_score(st) - r.best_run.extra['mixture_at_root']) < 1e-6

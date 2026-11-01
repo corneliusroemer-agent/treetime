@@ -186,15 +186,29 @@ class Stage2Result:
         ok = [r for r in self.rows if r[col] is not None and np.isfinite(r[col])]
         return max(ok, key=lambda r: r[col])['candidate_id'] if ok else None
 
+    def best_root(self, col):
+        ok = [r for r in self.rows if r[col] is not None and np.isfinite(r[col])]
+        return max(ok, key=lambda r: r[col]).get('root_id_1') if ok else None
+
     def margin(self, col):
-        sc = sorted((r[col] for r in self.rows if r[col] is not None and np.isfinite(r[col])), reverse=True)
+        """Gap between the best and the second distinct rooted tree in ``col``
+        (rows of one fitted Stage 1 tree, ``root_id_1``, count once)."""
+        best = {}
+        for r in self.rows:
+            v = r[col]
+            if v is None or not np.isfinite(v):
+                continue
+            k = r.get('root_id_1') or r['candidate_id']
+            best[k] = max(best.get(k, -np.inf), v)
+        sc = sorted(best.values(), reverse=True)
         return sc[0] - sc[1] if len(sc) > 1 else None
 
     def summary(self):
         out = {
             'stage1_best': self.stage1.best.candidate_id, 'stage1_margin': self.stage1.margin,
             'stage1_resolved': self.stage1.best_is_resolved,
-            'stage2a_best': self.best('combined_2a'), 'stage2a_margin': self.margin('combined_2a'),
+            'stage2a_best': self.best('combined_2a'), 'stage2a_best_root': self.best_root('combined_2a'),
+            'stage2a_margin': self.margin('combined_2a'),
             'stage2b_best': self.stage2b.best.candidate_id, 'stage2b_best_root': self.stage2b.best.root_id,
             'stage2b_margin': self.stage2b.margin,
             'stage2b_resolved': self.stage2b.best_is_resolved,
@@ -334,7 +348,7 @@ def rank_with_root_messages(baseline, messages, explicit=(), regression_k=5, pos
     for r1 in stage1.results:
         row = {'candidate_id': r1.candidate_id, 'source': r1.source,
                'source_ranks': format_source_ranks(r1.source_ranks), 'regression_rank': r1.regression_rank,
-               'ingroup_1': r1.score}
+               'ingroup_1': r1.score, 'root_id_1': r1.root_id}
         try:
             tt1 = copy.deepcopy(restore_best_fitted_state(r1))
             c = root_message_correction(tt1, messages)

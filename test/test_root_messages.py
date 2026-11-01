@@ -398,3 +398,13 @@ def test_final_rate_refit_carries_root_state_messages(b20, fitted):
     s = on.summary()
     assert s['stage2b_headline_root_date'] == ref2b['shared_root_date']
     assert 'stage2b_headline_root_date' not in off.summary()
+
+
+def test_stage2a_margin_counts_each_fitted_tree_once():
+    from treetime.root_messages import Stage2Result
+    rows = [{'candidate_id': 'edge:L17-INT_0005', 'root_id_1': 'node:INT_0005', 'combined_2a': -10.0},
+            {'candidate_id': 'node:INT_0005', 'root_id_1': 'node:INT_0005', 'combined_2a': -10.0002},
+            {'candidate_id': 'node:INT_0004', 'root_id_1': 'node:INT_0004', 'combined_2a': -12.0}]
+    s = Stage2Result(stage1=None, stage2b=None, rows=rows)
+    assert abs(s.margin('combined_2a') - 2.0) < 1e-12
+    assert s.best('combined_2a') == 'edge:L17-INT_0005' and s.best_root('combined_2a') == 'node:INT_0005'

@@ -38,6 +38,8 @@ import time
 import numpy as np
 from Bio import Phylo
 
+from . import config as ttconf
+
 from .root_candidates import (FIT_ERRORS, FitRun, classify_trajectory, evaluate_root_candidate)
 from .seq_utils import seq2prof
 
@@ -349,8 +351,13 @@ class OutgroupEvaluator:
     and scores the fitted state by the exact mixture log-likelihood with the
     lengths refitted there; the candidate's score is the best such score. Rounds
     continue (up to ``outer_iterations`` after round 0) while refitting the
-    lengths at the best state gains at least ``tol``, as for w = 0. The
-    trajectory ``scores`` are the surrogate's; ``run.extra`` holds the mixture
+    lengths at the best state gains at least ``tol`` and the last round
+    improved. A warm start state is itself scored by the exact mixture and
+    kept if no fitted state beats it, so the score is never below the post-hoc
+    mixture of that state. The trajectory ``scores`` are the surrogate's
+    (close to the ingroup log-likelihood; ``trajectory_class``,
+    ``tail_fluctuation`` and so the ``uncertainty`` read them as optimiser
+    noise), while ``best_score`` is the exact mixture; ``run.extra`` holds the mixture
     terms, responsibilities and per-attachment lengths, and
     ``outgroup_lengths`` are those of the attachment at the root. The kept state
     carries the plain message of that attachment. w = 0 is exactly the
@@ -441,6 +448,23 @@ class OutgroupEvaluator:
         run.best_score = rec['score']
         return run, rec
 
+    @staticmethod
+    def _start_run(baseline, cand, start, clock_rate, st0):
+        """FitRun holding the warm start state itself, scored by its exact mixture."""
+        from .root_candidates import _root_summary, fitted_newick
+        run = FitRun(candidate=cand, candidate_id=baseline.candidate_id(cand), initial_fraction=None,
+                     initial_mode='warm')
+        st = copy.deepcopy(start)
+        st.set_root_state_messages(None)
+        run.scores, run.best_index, run.best_score = [st0['score']], 0, st0['score']
+        run.clock_rate = clock_rate
+        run.clock_rates = [clock_rate]
+        run.root = _root_summary(baseline, cand, st)
+        run.fitted_newick = fitted_newick(st)
+        run.state = st
+        run.trajectory_class = classify_trajectory(run.scores)
+        return run
+
     def _call_mixture(self, baseline, cand, fit, keep_state, catch_errors, clock_rate, initial_state):
         og, w = self.outgroup, self.w
         t0 = time.time()
@@ -454,13 +478,20 @@ class OutgroupEvaluator:
                 start = baseline.make_treeanc(baseline.rooted_phylo(cand), messages=False)
             mix0 = AttachmentMixture(start, og)
             lengths, values = mix0.fit(x0=og.lengths)
+            st0 = {'mix': mix0, 'lengths': lengths, 'values': values, 'score': mix0.score(w, values)}
+            start_run = None
+            if initial_state is not None:
+                # a dated start state is a candidate state too: the score is never below its exact mixture
+                start_run = self._start_run(baseline, cand, start, clock_rate, st0)
             del start
-            st0 = {'mix': mix0, 'lengths': lengths, 'values': values}
             run, rec = self._mixture_round(baseline, cand, fit, clock_rate, initial_state, st0)
             runs.append(run)
-            rounds.append({'round': 0, 'pre_fit_score': mix0.score(w, values), 'best_score': rec['score'],
+            rounds.append({'round': 0, 'pre_fit_score': st0['score'], 'best_score': rec['score'],
                            'surrogate_best': rec['surrogate_best']})
             best_run, best = run, rec
+            if start_run is not None and st0['score'] > rec['score']:
+                runs.insert(0, start_run)
+                best_run, best = start_run, dict(st0, score_at_fit_lengths=st0['score'])
             for k in range(self.outer_iterations):
                 gain = best['score'] - best['score_at_fit_lengths']
                 if gain < self.tol:
@@ -472,6 +503,9 @@ class OutgroupEvaluator:
                                'surrogate_best': rec['surrogate_best']})
                 if rec['score'] > best_run.best_score:
                     best_run, best = run, rec
+                else:  # the next round would start from the same state with the same message
+                    rounds[-1]['stopped'] = 'no gain'
+                    break
             # the kept state carries the plain message of the attachment at the root
             best_run.state.set_root_state_messages(og.messages(best['lengths'][0]))
             out = _merge_runs(runs, best_run, keep_state)
@@ -664,8 +698,11 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
     its shortlist fits.
 
     ``attach_mixture_w``: attachment-mixture weight inside the Stage 3 dated
-    fit (:class:`OutgroupEvaluator`); 0 (default) is the unmixed Stage 3. The
-    Stage 3 scores are then mixture log-likelihoods, and so are ``combined_3``.
+    fit (:class:`OutgroupEvaluator`); 0 (default) is the unmixed Stage 3. With
+    w > 0 the Stage 3 scores and ``combined_3`` are mixture log-likelihoods,
+    while ``ingroup_3`` + ``outgroup_3`` and ``posthoc_3`` are the attachment
+    at the root only (compare ``combined_3`` with ``mixture[w]``, not with
+    ``posthoc_3``).
 
     ``mixture_ws``: attachment-mixture weights w scored post hoc
     (:func:`attachment_mixture_scores`) at each candidate's Stage 1 and Stage 3
@@ -853,10 +890,27 @@ def joint_tree_cmaple(sequences, iqtree='iqtree3', model='GTR', seed=1):
 # --------------------------------------------------------------------------
 # attachment mixture (post hoc): uncertainty about where the outgroup joins
 # --------------------------------------------------------------------------
+def _collapsed_side(tt, kids):
+    """For a bifurcating root, the index (0/1) of the child the root has
+    collapsed onto (its root edge within COLLAPSE_TOL expected mutations, the
+    shorter one), else None. Such a state is that child's node-rooted tree,
+    and gets that node's neighbours."""
+    from .root_candidates import COLLAPSE_TOL
+    if len(kids) != 2:
+        return None
+    n = tt.data.full_length
+    ls = [float(c.branch_length) for c in kids]
+    k = int(np.argmin(ls))
+    return k if ls[k] * n <= COLLAPSE_TOL else None
+
+
 def _unrooted_from_state(tt):
     """Adjacency {node index: {node index: length}} of a fitted ingroup state at
     the lengths its likelihood uses; a bifurcating root is suppressed. Returns
-    (adj, names, neighbour edges of the root position, root edge or None)."""
+    (adj, names, neighbour edges of the root position, root edge or None).
+    Neighbours: for a root inside edge (u, v), the other edges at u and at v;
+    for a root at a node, its incident edges; a root collapsed onto u (within
+    COLLAPSE_TOL expected mutations) counts as the node root at u."""
     nodes = list(tt.tree.find_clades(order='preorder'))
     idx = {id(n): i for i, n in enumerate(nodes)}
     adj = {i: {} for i in range(len(nodes))}
@@ -867,10 +921,14 @@ def _unrooted_from_state(tt):
     names = {idx[id(n)]: n.name for n in nodes if n.is_terminal()}
     kids = list(adj[0])
     if len(kids) == 2:  # root inside edge (u, v): neighbours are the other edges at u and at v
+        side = _collapsed_side(tt, tt.tree.root.clades)
         u, v = kids
         tu, tv = adj[0][u], adj[0][v]
         del adj[u][0], adj[v][0], adj[0]
         adj[u][v] = adj[v][u] = tu + tv
+        if side is not None:  # collapsed onto one child: that node's incident edges
+            x = kids[side]
+            return adj, names, [(x, w) for w in adj[x]], (u, v, tu / (tu + tv) if tu + tv > 0 else 0.5)
         nb = [(u, w) for w in adj[u] if w != v] + [(v, w) for w in adj[v] if w != u]
         return adj, names, nb, (u, v, tu / (tu + tv) if tu + tv > 0 else 0.5)
     return adj, names, [(0, w) for w in kids], None
@@ -964,15 +1022,28 @@ class AttachmentMixture:
         E = base.gtr.expQt
         root = base.tree.root
         kids = list(root.clades)
-        if len(kids) == 2:  # root inside an edge: neighbours are the child edges of both root children
+        side = _collapsed_side(base, kids)
+        if side is not None:  # root collapsed onto one child x: x's incident edges (as _unrooted_from_state)
+            x, y = kids[side], kids[1 - side]
+            pairs = [(x, w) for w in x.clades] + [(root, y)]
+        elif len(kids) == 2:  # root inside an edge: neighbours are the child edges of both root children
             pairs = [(u, w) for u in kids for w in u.clades]
         else:
             pairs = [(root, w) for w in kids]
+        floor = ttconf.MIN_BRANCH_LENGTH * base.one_mutation  # each half-edge floored, as a rerooted TreeAnc does
         self.neighbours = []
         for p, c in pairs:
             t = float(base._branch_length_to_gtr(c))
             lc = c.marginal_subtree_LH[G['c']]
-            nb = {'edge': (p.name, c.name), 'B': lc @ E(t), 'down': lc @ E(t / 2.0), 'up': E(t / 2.0)}
+            if p is root and side is not None:
+                # the edge x - y through the root: its midpoint X lies between the root and y, at h - t_x
+                # from the root and h from y (h half of t_x + t_y)
+                tx = float(base._branch_length_to_gtr(kids[side]))
+                h = max((tx + t) / 2.0, floor)
+                nb = {'edge': (kids[side].name, c.name), 'B': lc @ E(t), 'down': lc @ E(h), 'up': E(max(h - tx, 0.0))}
+            else:
+                h = max(t / 2.0, floor)
+                nb = {'edge': (p.name, c.name), 'B': lc @ E(t), 'down': lc @ E(h), 'up': E(h)}
             if p is not root:
                 tp = float(base._branch_length_to_gtr(p))
                 lp = p.marginal_subtree_LH[G['c']]
@@ -1045,9 +1116,10 @@ class AttachmentMixture:
         mu equals the ingroup log-likelihood, and with the m~_j held fixed its
         derivative in an ingroup branch length is sum_j r_j dl_j / l_j per site,
         the derivative of the EM objective sum_j r_j log L_j, except that term
-        j's part is approximate for the branches of neighbour j's own edge,
-        the subtree below it and (root inside an edge) the root edge above it:
-        there the outgroup's pull is frozen at this state. So the dated fit with
+        j's part is approximate for the branches of neighbour j's own edge and
+        the subtree below it and, when the edge hangs below a root child p, for
+        the root edge above p and p's other subtrees: there the outgroup's pull
+        is frozen at this state. So the dated fit with
         mu is a first-order M-step weighted by the responsibilities, exact for
         term 0 (the attachment at the root). The evaluator rebuilds mu at each
         new state and scores every state by the exact mixture. With all

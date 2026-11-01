@@ -1586,6 +1586,7 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
             for x in r.runs:
                 if x is not b:
                     x.state = None
+    merge_duplicate_roots(baseline, results, collapse_tol)
     refit = None
     if final_rate_refit and results and np.isfinite(results[0].score):
         rargs = (evaluate, fit.rate_clamp, final_rate_xatol, final_rate_evals, final_rate_iterations, catch_errors)
@@ -1594,7 +1595,8 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         if final_rate_refit_window is not None:
             top = results[0].score
             close = [refit] + [_final_rate_refit_one(r, *rargs) for r in results[1:]
-                               if np.isfinite(r.score) and top - r.score <= final_rate_refit_window]
+                               if r.duplicate_of is None and np.isfinite(r.score)
+                               and top - r.score <= final_rate_refit_window]
             order = sorted(close, key=lambda c: -(c['refit_logL'] if c['refit_logL'] is not None else -np.inf))
             refit['close'] = [dict(c, refit_rank=order.index(c) + 1) for c in close]
             refit['close_refit_best'] = order[0]['candidate_id']
@@ -1606,7 +1608,6 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         if refit is not None:
             for c in [refit] + refit.get('close', []):
                 c['state'] = None
-    merge_duplicate_roots(baseline, results, collapse_tol)
     if results:
         top = results[0]
         for r in results:

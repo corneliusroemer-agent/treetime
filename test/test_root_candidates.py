@@ -831,3 +831,28 @@ def test_profile_point_iterates_until_converged(refit_pair):
         it, gain = run.extra['profile_iterations'], run.extra['profile_last_gain']
         assert 2 <= it <= 8 and v >= two - 1e-9
         assert it == 8 or gain is None or gain < 0.01
+
+
+def test_rate_profile_failure_next_to_best_is_not_converged():
+    from types import SimpleNamespace
+
+    def point(mu):  # increasing in the rate up to 2.0, failing above: the best point borders a failure
+        if mu > 2.0:
+            return -np.inf, SimpleNamespace(error='boom')
+        return float(np.log(mu)), SimpleNamespace(error=None)
+    f = fit_rate_profile(point, 1.0)
+    assert f['error'] is None and f['mu'] <= 2.0 and f['failure_next_to_best'] and f['converged'] is False
+
+
+def test_profile_point_keeps_the_better_block(monkeypatch):
+    """A later block that scores worse never replaces the earlier one."""
+    from types import SimpleNamespace
+    import treetime.root_candidates as rc
+    monkeypatch.setattr(rc, 'rescale_times_for_rate', lambda state, mu0, mu: state)
+    calls = []
+
+    def ev(c, mode, rounds, warm=None, iterations=None):
+        calls.append(1)
+        return SimpleNamespace(error=None, best_score=-10.0 - len(calls), state=object(), extra={})
+    v, run = profile_rate_point(ev, None, None, 1.0, 1.0)
+    assert v == -11.0 and len(calls) == 2 and run.extra['profile_iterations'] == 4
