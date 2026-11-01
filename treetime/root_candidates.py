@@ -15,6 +15,9 @@ Layout
 * :class:`NodeRoot` / :class:`EdgeRoot` -- candidate root placements.
 * :func:`regression_candidates` -- the best placements of the existing
   root-to-tip regression (:meth:`TreeRegression.rank_roots`).
+* :class:`LsdvSource` -- opt-in candidate source ranked by the lsdv regression
+  (:mod:`treetime.ls_dated_rate`); ``UnrootedBaseline(shared_rate='lsdv')``
+  takes the shared rate from it.
 * :func:`evaluate_root_candidate` -- one candidate from one initialisation: a
   new ``TreeTime`` object, a fixed number of fitting iterations without the
   ``ndiff`` early stop, a fresh likelihood after every time tree, and a copy of
@@ -115,8 +118,23 @@ class UnrootedBaseline:
     gtr : GTR or str
         Fixed substitution model, never re-inferred; deep-copied per candidate.
     clock_rate : float, optional
-        Fixed positive rate shared by all candidates. ``None`` takes the slope
-        of the best free-slope root-to-tip regression on the baseline.
+        Fixed positive rate shared by all candidates. ``None`` takes it from
+        ``shared_rate``.
+    shared_rate : {'regression', 'lsdv'}
+        Source of the shared rate when ``clock_rate`` is None.
+        ``'regression'`` (default): the slope of the best free-slope plain
+        root-to-tip regression on the baseline. ``'lsdv'``: the lsdv rate
+        (:func:`treetime.ls_dated_rate.lsdv_flat`, covariation regression with
+        least-squares-dated variances) at the regression's best placement, or
+        with ``shared_rate_k`` > 1 the median of the lsdv rates at the top
+        ``shared_rate_k`` distinct placements of that regression. Falls back to
+        the regression slope (``shared_rate_info['fallback']``) when no
+        placement gives a positive lsdv rate.
+    shared_rate_k : int
+        Number of regression placements for ``shared_rate='lsdv'``.
+    shared_rate_kwargs : dict, optional
+        Options of the lsdv rate (``tip_slack``, default 3; ``rounds``,
+        default 1; ``collapse``, default True).
     optimize_baseline : bool
         Re-estimate branch lengths once with TreeTime's marginal optimiser on
         the unrooted tree, as ``TreeTime.run`` does before rerooting. These
@@ -126,10 +144,16 @@ class UnrootedBaseline:
         from one candidate to the next.
     tt_kwargs : dict, optional
         Extra TreeTime constructor arguments (e.g. ``precision``).
+
+    Attributes: ``clock_rate``; ``shared_rate_info`` (None for the default
+    regression rate or a given ``clock_rate``; for ``'lsdv'`` a dict with the
+    rate used, the regression slope, the per-placement lsdv rates and their
+    spread, ``log_range`` = log(max / min), a diagnostic of how strongly the
+    rate depends on the root).
     """
 
     def __init__(self, tree, aln, dates, gtr='JC69', clock_rate=None, optimize_baseline=True,
-                 rng_seed=1234, tt_kwargs=None):
+                 rng_seed=1234, tt_kwargs=None, shared_rate='regression', shared_rate_k=1, shared_rate_kwargs=None):
         tree = Phylo.read(tree, 'newick') if isinstance(tree, str) else copy.deepcopy(tree)
         self.aln = aln
         self.dates = dict(dates)
@@ -142,11 +166,19 @@ class UnrootedBaseline:
             tt = self.make_treetime(self.rooted_phylo(None), messages=False)
             tt.optimize_tree(infer_gtr=False, max_iter=1, method_anc='probabilistic', **_seq_kwargs())
             self._from_phylo(tt.tree, keep_names=True)
+        if shared_rate not in ('regression', 'lsdv'):
+            raise ValueError("UnrootedBaseline: shared_rate must be 'regression' or 'lsdv'")
+        if shared_rate != 'regression' and clock_rate is not None:
+            raise ValueError('UnrootedBaseline: pass either clock_rate or shared_rate, not both')
+        self.shared_rate_info = None
         if clock_rate is None:
             best = self.regression().find_best_root(force_positive=True)
             if best is None or not best['slope'] > 0:
                 raise ValueError('UnrootedBaseline: no positive clock rate from regression; pass clock_rate')
             clock_rate = float(best['slope'])
+            if shared_rate == 'lsdv':
+                self.shared_rate_info = self._lsdv_shared_rate(clock_rate, shared_rate_k, shared_rate_kwargs or {})
+                clock_rate = self.shared_rate_info['rate']
         if not clock_rate > 0:
             raise ValueError('UnrootedBaseline: clock_rate must be positive')
         self.clock_rate = float(clock_rate)
@@ -339,6 +371,62 @@ class UnrootedBaseline:
         treg = tt.setup_TreeRegression(covariation=covariation)
         treg._tt = tt  # keep the node owner alive
         return treg
+
+    @property
+    def full_length(self):
+        """Number of alignment sites as TreeTime counts them (``data.full_length``)."""
+        if getattr(self, '_full_length', None) is None:
+            self._full_length = int(self.make_treetime(self.rooted_phylo(None), messages=False).data.full_length)
+        return self._full_length
+
+    def _tip_date(self, leaf):
+        d = self.dates.get(leaf.name)
+        if d is None:
+            return np.nan
+        d = float(np.mean(d))
+        return d if np.isfinite(d) else np.nan
+
+    def lsdv(self, cand, tip_slack=3.0, rounds=1, collapse=True, rate=None):
+        """lsdv rate at root placement ``cand`` on the baseline branch lengths:
+        :func:`treetime.ls_dated_rate.lsdv_flat` on the rooted tree, equal to
+        :func:`~treetime.ls_dated_rate.ls_dated_variance_rate` on a TreeTime
+        object rooted there. Raises ``ValueError`` when the plain root-to-tip
+        rate at ``cand`` (the reference rate unless ``rate`` is given) is not
+        positive."""
+        from .ls_dated_rate import _flatten, lsdv_flat
+        L = self.full_length
+        f = _flatten(self.rooted_phylo(self.canonical(cand)), 1.0 / L, collapse=collapse,
+                     length=lambda n: n.branch_length, date=self._tip_date)
+        return lsdv_flat(f, L, tip_slack=tip_slack, rate=rate, rounds=rounds)
+
+    def _lsdv_shared_rate(self, regression_rate, k, kwargs):
+        """Median lsdv rate over the top ``k`` free-slope plain regression placements."""
+        t0 = time.time()
+        if not (isinstance(k, int) and k >= 1):
+            raise ValueError('UnrootedBaseline: shared_rate_k must be a positive integer')
+        rows = []
+        for cand, info in regression_candidates(self, k=k, covariation=False, slope=None):
+            row = {'candidate_id': self.candidate_id(cand), 'regression_rank': info['regression_rank'],
+                   'lsdv_rate': None, 'plain_rate': None, 'root_date': None, 'error': None}
+            try:
+                r = self.lsdv(cand, **kwargs)
+                row.update(lsdv_rate=r['rate'], plain_rate=r['plain_rate'], root_date=r['root_date'])
+                if not r['rate'] > 0:
+                    row['error'] = 'lsdv rate not positive'
+            except (ValueError, FloatingPointError, ZeroDivisionError) as e:
+                row['error'] = str(e)
+            rows.append(row)
+        ok = np.array([r['lsdv_rate'] for r in rows if r['error'] is None], float)
+        info = {'source': 'lsdv', 'k': k, 'kwargs': dict(kwargs), 'regression_rate': float(regression_rate),
+                'candidates': rows, 'n_ok': len(ok), 'fallback': None}
+        if len(ok):
+            info.update(rate=float(np.median(ok)), min=float(ok.min()), max=float(ok.max()),
+                        log_range=float(np.log(ok.max() / ok.min())))
+        else:
+            info.update(rate=float(regression_rate), min=None, max=None, log_range=None,
+                        fallback='no positive lsdv rate at the regression placements; regression slope used')
+        info['seconds'] = time.time() - t0
+        return info
 
     def topology_signature(self, tree):
         """(set of non-trivial splits, sorted internal degrees) of ``tree`` read as
@@ -806,6 +894,71 @@ def plain_candidate_sources(k=5):
     return (RegressionSource('plain', k),)
 
 
+@dataclass(frozen=True)
+class LsdvSource:
+    """Candidate source ranked by the lsdv regression (opt-in): the best ``k``
+    placements by the GLS residual (chisq) of the lsdv fit at each placement,
+    each at its own lsdv rate (:meth:`UnrootedBaseline.lsdv`). It composes with
+    the regression sources and ranked sources like a :class:`RegressionSource`,
+    e.g. ``candidate_sources=default_candidate_sources(5) + (LsdvSource(),)``.
+
+    The placements scored:
+
+    * ``rerank`` = N (default 20): the top N distinct placements of the
+      covariation regression (tip slack ``base_tip_slack``, free slope), at its
+      fractions;
+    * ``rerank=None``: every placement, i.e. every distinct placement the
+      covariation regression ranks (at its fractions) plus the midpoint of every
+      edge and every internal node it does not rank. This costs one lsdv fit per
+      edge, O(n^2) in total (about 0.3 s at 80 tips).
+
+    A placement whose plain root-to-tip rate or lsdv rate is not positive is
+    skipped. Each candidate's info carries ``regression_rank`` (rank by lsdv
+    chisq), ``regression_chisq``, ``regression_split`` (fraction scored),
+    ``lsdv_rate``, ``lsdv_root_date`` and ``base_rank`` (rank in the covariation
+    regression, None for added placements). The chisq values of different roots
+    use different variances (durations at each root's own plain rate); whether
+    this ranking places roots better than cov3 is an open benchmark question."""
+
+    name: str = 'lsdv'
+    k: Optional[int] = 5
+    rerank: Optional[int] = 20
+    tip_slack: float = 3.0
+    rounds: int = 1
+    base_tip_slack: float = 3.0
+    node_edges: Optional[int] = 0  # unused; kept so callers reading RegressionSource fields can read this too
+
+    def candidates(self, baseline):
+        return self.candidates_and_expansions(baseline)[0]
+
+    def candidates_and_expansions(self, baseline):
+        edges = _regression_edges(baseline, True, self.base_tip_slack, None)
+        base = _distinct_placements(baseline, edges, self.rerank)
+        pool = [(c, info['regression_rank']) for c, info in base]
+        if self.rerank is None:
+            seen = {candidate_key(c) for c, _ in pool}
+            for c in baseline.all_candidates():
+                c = baseline.canonical(c)
+                if candidate_key(c) not in seen:
+                    seen.add(candidate_key(c))
+                    pool.append((c, None))
+        scored = []
+        for c, base_rank in pool:
+            try:
+                r = baseline.lsdv(c, tip_slack=self.tip_slack, rounds=self.rounds)
+            except (ValueError, FloatingPointError, ZeroDivisionError):
+                continue
+            if r['rate'] > 0 and np.isfinite(r['chisq']):
+                scored.append((r['chisq'], len(scored), c, base_rank, r))
+        scored.sort(key=lambda x: x[:2])
+        out = []
+        for chisq, _, c, base_rank, r in scored[:self.k]:
+            out.append((c, {'regression_rank': len(out) + 1, 'regression_chisq': float(chisq),
+                            'regression_split': getattr(c, 'fraction', None), 'lsdv_rate': r['rate'],
+                            'lsdv_root_date': r['root_date'], 'base_rank': base_rank}))
+        return out, []
+
+
 @dataclass
 class ShortlistEntry:
     """One distinct candidate (node, or edge regardless of fraction) of a shortlist."""
@@ -995,6 +1148,7 @@ class RootSearchResult:
     min_margin: float
     config: dict
     final_rate_refit: Optional[dict] = None  # see rank_root_candidates(final_rate_refit=); None when off
+    final_lsdv: Optional[dict] = None  # see rank_root_candidates(final_lsdv=); None when off
 
     @property
     def best(self):
@@ -1079,6 +1233,12 @@ class RootSearchResult:
         if ref is not None:
             out.update({'headline_root_date': self.headline_root_date, 'headline_clock_rate': self.headline_clock_rate,
                         'final_rate_refit': final_rate_refit_summary(ref)})
+        if self.final_lsdv is not None:
+            out['final_lsdv'] = dict(self.final_lsdv)
+        sri = self.config.get('shared_rate_info')
+        if sri is not None:
+            out['shared_rate_source'] = sri['source']
+            out['shared_rate_log_range'] = sri.get('log_range')
         return out
 
     def rows(self):
@@ -1405,7 +1565,7 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
                          candidate_sources=None, ranked_sources=None, evaluator=None, final_rate_refit=False,
                          final_rate_evals=FINAL_RATE_EVALS, final_rate_xatol=FINAL_RATE_XATOL,
                          final_rate_iterations=FINAL_RATE_ITERATIONS, final_rate_refit_window=None,
-                         collapse_tol=COLLAPSE_TOL):
+                         collapse_tol=COLLAPSE_TOL, final_lsdv=False):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
@@ -1527,6 +1687,12 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     return type) for every fit; Stage 3 passes an
     :class:`~treetime.outgroup_subtree.OutgroupEvaluator`, whose messages depend
     on the candidate. Selection, rate fits and margins are unchanged.
+
+    ``final_lsdv`` (opt-in, report only; ``True`` or a dict of
+    :meth:`UnrootedBaseline.lsdv` options): the lsdv rate and root date at the
+    winner's fitted root (``root_candidate``, on the baseline branch lengths),
+    in :attr:`RootSearchResult.final_lsdv` and the summary. Ranking, scores and
+    the headline are unchanged. ``False`` gives exactly the output without it.
     """
     fit = fit or FitConfig()
     sources = resolve_candidate_sources(regression_k, candidate_sources, covariation, tip_slack)
@@ -1629,8 +1795,33 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
         config.update({'final_rate_refit': True, 'final_rate_evals': final_rate_evals,
                        'final_rate_xatol': final_rate_xatol, 'final_rate_iterations': final_rate_iterations,
                        'final_rate_refit_window': final_rate_refit_window})
+    if getattr(baseline, 'shared_rate_info', None) is not None:
+        config['shared_rate_info'] = baseline.shared_rate_info
+    lsdv_out = None
+    if final_lsdv:
+        lkw = dict(final_lsdv) if isinstance(final_lsdv, dict) else {}
+        config['final_lsdv'] = lkw
+        if results:
+            lsdv_out = _final_lsdv(baseline, results[0], lkw)
     return RootSearchResult(results=results, clock_rate=baseline.clock_rate, min_margin=min_margin, config=config,
-                            final_rate_refit=refit)
+                            final_rate_refit=refit, final_lsdv=lsdv_out)
+
+
+def _final_lsdv(baseline, r, kwargs):
+    """lsdv rate and root date at a result's fitted root (its candidate if the fit failed)."""
+    cand = getattr(r, 'root_candidate', None) or r.candidate
+    out = {'candidate_id': r.candidate_id, 'root_id': baseline.candidate_id(cand),
+           'fraction': getattr(cand, 'fraction', None), 'rate': None, 'root_date': None, 'plain_rate': None,
+           'intercept': None, 'chisq': None, 'error': None}
+    try:
+        x = baseline.lsdv(cand, **kwargs)
+        out.update(rate=x['rate'], root_date=x['root_date'] if x['rate'] > 0 else None,
+                   plain_rate=x['plain_rate'], intercept=x['intercept'], chisq=x['chisq'])
+        if not x['rate'] > 0:
+            out['error'] = 'lsdv rate not positive'
+    except (ValueError, FloatingPointError, ZeroDivisionError) as e:
+        out['error'] = str(e)
+    return out
 
 
 # --------------------------------------------------------------------------
