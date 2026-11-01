@@ -320,6 +320,9 @@ class OutgroupSubtree:
 # --------------------------------------------------------------------------
 # per-candidate evaluator: alternating outgroup lengths <-> ingroup dated fit
 # --------------------------------------------------------------------------
+DEFAULT_ATTACH_MIXTURE_W = 0.01
+
+
 class OutgroupEvaluator:
     """Drop-in replacement for :func:`evaluate_root_candidate` (pass as
     ``rank_root_candidates(..., evaluator=)``): the outgroup subtree hangs off
@@ -361,12 +364,15 @@ class OutgroupEvaluator:
     terms, responsibilities and per-attachment lengths, and
     ``outgroup_lengths`` are those of the attachment at the root. The kept state
     carries the plain message of that attachment. w = 0 is exactly the
-    unmixed evaluator.
+    unmixed evaluator. ``attach_mixture_w=None`` (default) means
+    ``DEFAULT_ATTACH_MIXTURE_W`` (0.01), or 0 with ``fit_lengths=False``.
     """
 
-    def __init__(self, outgroup, outer_iterations=2, tol=1e-2, fit_lengths=True, attach_mixture_w=0.0):
+    def __init__(self, outgroup, outer_iterations=2, tol=1e-2, fit_lengths=True, attach_mixture_w=None):
         self.outgroup = outgroup
         self.outer_iterations, self.tol, self.fit = int(outer_iterations), float(tol), bool(fit_lengths)
+        if attach_mixture_w is None:
+            attach_mixture_w = DEFAULT_ATTACH_MIXTURE_W if fit_lengths else 0.0
         self.w = float(attach_mixture_w)
         if not 0.0 <= self.w <= 1.0:
             raise ValueError('attach_mixture_w must be in [0, 1]')
@@ -672,7 +678,7 @@ def _rows(stage1, stage3, outgroup, is_extra=False, baseline=None, mixture_ws=()
 
 def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, attachment='scan',
                                attach_k=3, extra_candidates=(), stage1=None, warm_start=True, outer_iterations=2,
-                               tol=1e-2, fit_lengths=True, mixture_ws=(), attach_mixture_w=0.0, **rank_kwargs):
+                               tol=1e-2, fit_lengths=True, mixture_ws=(), attach_mixture_w=None, **rank_kwargs):
     """Stage 1 and Stage 3 (outgroup subtree, lengths fitted per candidate) on
     one candidate set.
 
@@ -698,7 +704,10 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
     its shortlist fits.
 
     ``attach_mixture_w``: attachment-mixture weight inside the Stage 3 dated
-    fit (:class:`OutgroupEvaluator`); 0 (default) is the unmixed Stage 3. With
+    fit (:class:`OutgroupEvaluator`). ``None`` (default) is
+    ``DEFAULT_ATTACH_MIXTURE_W`` = 0.01 (report 106), or 0 when
+    ``fit_lengths=False`` (the mixture needs fitted lengths); 0 is the unmixed
+    Stage 3. With
     w > 0 the Stage 3 scores and ``combined_3`` are mixture log-likelihoods,
     while ``ingroup_3`` + ``outgroup_3`` and ``posthoc_3`` are the attachment
     at the root only (compare ``combined_3`` with ``mixture[w]``, not with
@@ -765,7 +774,7 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
                     c['state'] = None
     config = {'outer_iterations': outer_iterations, 'tol': tol, 'fit_lengths': fit_lengths,
               'attach_k': attach_k, 'regression_k': regression_k, 'warm_start': warm_start, 'mixture_ws': mixture_ws,
-              'attach_mixture_w': float(attach_mixture_w),
+              'attach_mixture_w': ev.w,
               'outgroup_newick': outgroup.newick(), 'n_outgroup_patterns': outgroup.n_patterns}
     return Stage3Result(stage1, s3, rows, extra=extra_rows, scan=scan, config=config)
 

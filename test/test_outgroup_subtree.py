@@ -277,7 +277,7 @@ def test_length_fit_and_clock_untouched(fx):
         ta.set_root_state_messages(o.messages(ls))
         fresh_marginal_score(ta)
         assert abs(ta.tree.total_sequence_LH_ingroup - ing) < TOL
-    ev = OutgroupEvaluator(o, outer_iterations=2)
+    ev = OutgroupEvaluator(o, outer_iterations=2, attach_mixture_w=0.0)
     c = b.all_candidates()[3]
     run = ev(b, c, FitConfig(iterations=2))
     st = run.state
@@ -422,8 +422,8 @@ def test_mixture_in_driver_leaves_answer_unchanged():
     seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
     ogs = _outgroups(seqs, len(next(iter(seqs.values()))))
     kw = dict(regression_k=2, attach_k=1, fit=FitConfig(iterations=1), outer_iterations=1)
-    r0 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), **kw)
-    r1 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), mixture_ws=(0.0, 0.3), **kw)
+    r0 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), attach_mixture_w=0.0, **kw)
+    r1 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), mixture_ws=(0.0, 0.3), attach_mixture_w=0.0, **kw)
     assert [(r.candidate_id, r.score) for r in r1.stage3.results] == [(r.candidate_id, r.score) for r in r0.stage3.results]
     for row in r1.rows:
         assert row['mixture'][0.0] >= row['combined_3'] - 1e-9  # best state re-scored, lengths refitted
@@ -441,7 +441,7 @@ def test_stage3_final_rate_refit_carries_the_outgroup_subtree():
     seqs = {r.id: str(r.seq).upper() for r in AlignIO.read(aln, 'fasta')}
     o = OutgroupSubtree(b.gtr, _outgroups(seqs, len(next(iter(seqs.values())))))
     r = rank_with_outgroup_subtree(b, o, regression_k=2, attach_k=1, fit=FitConfig(iterations=1), outer_iterations=1,
-                                   final_rate_refit=True)
+                                   final_rate_refit=True, attach_mixture_w=0.0)
     ref = r.stage3.final_rate_refit
     assert ref['candidate_id'] == r.stage3.best.candidate_id and ref['refit_logL'] >= ref['shared_logL']
     assert not ref['refit_is_ranking_state'] and ref['refit_clock_rate'] != b.clock_rate
@@ -519,7 +519,7 @@ def mixture_runs():
     ogs = _outgroups(seqs, L)
     kw = dict(regression_k=3, attach_k=2, fit=FitConfig(iterations=2), outer_iterations=2)
     nw = '((O1,O2),O3);'
-    plain = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs, tree=nw), **kw)
+    plain = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs, tree=nw), attach_mixture_w=0.0, **kw)
     zero = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs, tree=nw), attach_mixture_w=0.0,
                                       stage1=plain.stage1, **kw)
     tiny = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs, tree=nw), attach_mixture_w=1e-6,
@@ -686,3 +686,14 @@ def test_attach_mixture_never_below_posthoc_start_and_keeps_plain_message(mixtur
         assert r.score >= m.score(0.2, vals) - 1e-3
         st = copy.deepcopy(r.best_run.state)
         assert abs(fresh_marginal_score(st) - r.best_run.extra['mixture_at_root']) < 1e-6
+
+
+def test_attach_mixture_w_default_is_0p01_and_0_without_length_fit():
+    from treetime.outgroup_subtree import DEFAULT_ATTACH_MIXTURE_W
+    o = None  # the constructor only stores the outgroup
+    assert DEFAULT_ATTACH_MIXTURE_W == 0.01
+    assert OutgroupEvaluator(o).w == 0.01
+    assert OutgroupEvaluator(o, fit_lengths=False).w == 0.0
+    assert OutgroupEvaluator(o, attach_mixture_w=0.0).w == 0.0
+    with pytest.raises(ValueError):
+        OutgroupEvaluator(o, fit_lengths=False, attach_mixture_w=0.1)
