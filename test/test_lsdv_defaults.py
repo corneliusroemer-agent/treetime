@@ -245,3 +245,12 @@ def test_flat_regression_equals_treeregression_bit_for_bit(seed):
         for k in ('slope', 'intercept', 'chisq'):
             assert a[k] == b[k]
         assert np.array_equal(a['cov'], b['cov'])
+
+
+def test_resampling_and_ladder_xo_under_the_defaults():
+    f = flat(80, seed=6, internal_min=1, planted=5)
+    r = ld.lsdv_flat(f, L, resample=20, seed=3)
+    assert r['resample']['n_ok'] >= 15 and r['resample']['rate_ci'][0] <= r['rate'] <= r['resample']['rate_ci'][1]
+    xo = ld.lsdv_flat(f, L, resolve='ladder_xo')
+    assert len(xo['xo_rates']) == 4 and xo['outliers'] == ld.lsdv_flat(f, L)['outliers']
+    assert 'outlier_clades' not in ld.lsdv_flat(f, L, outlier_clade_max=None)

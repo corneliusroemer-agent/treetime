@@ -32,8 +32,8 @@ outlying tip dates first; ``resolve=None, outlier_z=None``
 Cost is linear in the number of nodes: the regression runs TreeRegression's
 postorder recursion on flat arrays (:class:`_Regression`), with results equal to
 TreeRegression's to the bit. Report 93's estimator takes about 1 ms at 80 tips;
-the defaults about 0.1 s at 10k tips and a few seconds at 100k (the outlier
-rule dominates).
+the defaults about 0.6 s at 10k tips and 5 s at 100k (the outlier rule
+dominates; the ladder fit alone is 1 s at 100k).
 """
 import time
 
@@ -713,7 +713,9 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
                                                clade_max=o['outlier_clade_max'], clade_z=o['outlier_clade_z'],
                                                clades=clades)
         info.update(outliers=[f.name[i] for i in flagged], outlier_nodes=flagged, outlier_mode=o['outlier_mode'],
-                    outlier_passes=[[float(a), int(b)] for a, b in passes], outlier_clades=len(clades))
+                    outlier_passes=[[float(a), int(b)] for a, b in passes])
+        if o['outlier_clade_max'] is not None:
+            info['outlier_clades'] = len(clades)
         if o['outlier_mode'] == 'drop' and flagged:
             g = _with(f, date=dates)
     method = o['resolve']
@@ -773,7 +775,8 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
 
     - ``resolve``: 'auto' (default) = 'ladder', or 'ladder_xo' when there are
       more than ``resolve_auto_tips`` (1000) tips and the plain root-to-tip R^2,
-      computed after the outlier dates are dropped, is below
+      computed after the outlier dates are dropped (in 'flag' mode on all
+      dates), is below
       ``resolve_auto_r2`` (0.2; None = switch on size alone, report 103's
       rule with ``resolve_auto_tips=2000``). 'ladder' resolves every polytomy
       of the collapsed tree by attachment order before the fit (report 101);
@@ -788,15 +791,19 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
       ``outlier_clade_z`` (3; None = ``outlier_z``): the clade extension, an
       internal branch with |z| > ``outlier_clade_z`` above 2 to
       ``outlier_clade_max`` dated tips flags all of them (report 107);
-      ``outlier_clade_max=None`` turns it off. Reported: ``outliers`` (names),
+      ``outlier_clade_max=None`` turns it off (``outlier_clade_z`` is then
+      ignored). Reported: ``outliers`` (names),
       ``outlier_nodes``, ``outlier_passes`` ([robust rate, number flagged] per
-      pass), ``outlier_clades`` (number of internal branches that triggered).
+      pass) and, with the clade extension on, ``outlier_clades`` (number of
+      internal branches that triggered).
     - ``internal_b``: LSD2-style constant added to every internal branch's
       variance, in mutations (b x L in LSD2 units; LSD2's default is 10). 0 = off
       (default).
     - ``first_pass``: 'ls' (default; lsdv's unweighted LS node times) or 'lsd2'
       (LSD2's run 1: joint WLS with V = B + b) for the first round's durations;
-      with 'lsd2' round 1 uses neither the plain rate nor ``rate``.
+      with 'lsd2' round 1 uses neither the plain rate nor ``rate``, but the
+      ladder still needs a positive reference rate, so without one pass
+      ``resolve=None`` as well.
     - ``se_inflation``: factor on the SE in ``rate_ci`` (2, reports 97/101/107).
     - ``resample``: number of LSD2-style resampling replicates (0 = off) for
       ``resample['rate_ci']`` and ``resample['root_date_ci']``; ``resample_q``

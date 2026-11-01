@@ -24,7 +24,9 @@ from treetime.root_candidates import (EdgeRoot, FitConfig, LsdvSource, NodeRoot,
 
 L = 1000
 FIT1 = FitConfig(iterations=1)
-REPORT93_DEFAULTS = dict(ld.LSDV_OPTIONS, **ld.LSDV_REPORT93)
+# report 93's estimator, with the auto rule and outlier rule at their pre-107 settings (report 103's options)
+REPORT93_DEFAULTS = dict(ld.LSDV_OPTIONS, resolve_auto_tips=2000, resolve_auto_r2=None, outlier_clade_max=None,
+                         **ld.LSDV_REPORT93)
 
 
 @pytest.fixture(autouse=True)
