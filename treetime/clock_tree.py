@@ -315,8 +315,14 @@ class ClockTree(TreeAnc):
         :func:`treetime.resolved_rate.date_resolved_xfit_rate` (a covariation
         regression on a date-resolved copy of the tree with cross-fitted
         weights, options in ``self.clock_rate_method_kwargs``) whatever
-        ``covariation`` says; a fixed ``slope`` and the clock filter keep the
-        regression. Root search never calls this method, so it is unchanged.
+        ``covariation`` says (which only decides whether the model-based
+        standard error is attached, as on the regression path); a fixed
+        ``slope`` and the clock filter keep the regression, and a non-positive
+        estimate falls back to it with a warning. Root search never calls this
+        method. Inside ``run()`` with a root and ``use_covariation``, the
+        second reroot's regression reads clock_length from a time tree dated
+        at this method's rate, so the root it picks can differ from the
+        default run's.
         """
         if (self.clock_rate_method != 'regression' and slope is None
                 and not self._clock_rate_method_suspended):
@@ -325,12 +331,15 @@ class ClockTree(TreeAnc):
             from .resolved_rate import date_resolved_xfit_rate
             self.logger('ClockTree.get_clock_model: estimating clock model by date_resolved_xfit', 3)
             est = date_resolved_xfit_rate(self, **self.clock_rate_method_kwargs)
-            if not (np.isfinite(est['rate']) and est['rate'] > 0):
-                raise ValueError('Clock rate estimation (date_resolved_xfit) failed: rate %s. If your data lacks '
-                                 'temporal signal, please specify the rate explicitly!' % est['rate'])
-            self.clock_model = est.clock_model()
-            self.date2dist = DateConversion.from_regression(self.clock_model)
-            return
+            if np.isfinite(est['rate']) and est['rate'] > 0:
+                self.clock_model = est.clock_model()
+                if not covariation:  # as the regression path: no confidence interval without covariation
+                    self.clock_model.pop('cov', None)
+                    self.clock_model['valid_confidence'] = False
+                self.date2dist = DateConversion.from_regression(self.clock_model)
+                return
+            self.logger('ClockTree.get_clock_model: date_resolved_xfit gave rate %s; falling back to the '
+                        'regression' % est['rate'], 1, warn=True)
         self.logger(f'ClockTree.get_clock_model: estimating clock model with covariation={covariation}', 3)
         Treg = self.setup_TreeRegression(covariation=covariation)
         self.clock_model = Treg.regression(slope=slope)

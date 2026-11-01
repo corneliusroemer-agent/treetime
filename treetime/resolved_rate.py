@@ -15,7 +15,7 @@ leaves the tree it was given untouched:
    the pair (i, j) with the largest gain
        mu L (t_n - t_p) + sum_{c in i,j} k_c log((t_c - t_n) / (t_c - t_p)),
    maximised over t_n in [t_p, min(t_i, t_j)], is joined under a new node at
-   t_n, until no pair has a positive gain (k_c = mutation_length x L). Above
+   t_n, until no pair has a gain above 1e-9 (k_c = mutation_length x L). Above
    ``max_exact_polytomy`` children only pairs that are close in attachment time
    t_c - k_c / (mu L) are scored (see ``_resolve_restricted``).
 3. Covariation regression (root-to-tip GLS, TreeRegression's recursion) on the
@@ -28,7 +28,9 @@ leaves the tree it was given untouched:
 
 Per-half branch values split each branch's mutation_length in proportion to
 its mutations in each half (positions from ancestral reconstruction), scaled to
-full length, so the two halves add up to the full-data value exactly. Without
+full length: (L_A v_A + L_B v_B) / L is the full-data value exactly. A branch
+with length but no mutation keeps its length in both halves (its noise is then
+shared by the halves). Without
 mutation positions (no alignment or no reconstruction yet) the per-half counts
 are binomial thinnings of round(mutation_length x L).
 """
@@ -117,10 +119,13 @@ def _tip_date(n):
     return d if np.isfinite(d) else np.nan
 
 
-def _flatten(tree, om, positions):
-    """Flat copy of a Bio.Phylo tree; internal edges with no mutation and
-    length < COLLAPSE_MUTATIONS mutations are collapsed (their length and
-    mutations pushed onto the children, so every root-to-tip sum is kept)."""
+def _flatten(tree, om, positions, collapse=True):
+    """Flat copy of a Bio.Phylo tree. With ``collapse``, internal edges with no
+    mutation and length < COLLAPSE_MUTATIONS mutations are collapsed (their
+    length and mutations pushed onto the children, so every root-to-tip sum is
+    kept): TreeTime's own resolved but empty edges, or near-zero edges of the
+    input, are re-resolved by dates. ``positions``: id(node) -> mutated
+    columns, None for a node without them (thinned), or None overall."""
     f = _Flat()
     stack = [(tree.root, -1, 0.0, None)]
     while stack:
@@ -129,10 +134,10 @@ def _flatten(tree, om, positions):
             ml, pos = 0.0, (np.zeros(0, int) if positions is not None else None)
         else:
             ml = max(0.0, float(n.mutation_length)) + add_ml
-            pos = positions[id(n)] if positions is not None else None
+            pos = positions.get(id(n)) if positions is not None else None
             if pos is not None and add_pos is not None and len(add_pos):
                 pos = np.concatenate([pos, add_pos])
-        if n is not tree.root and not n.is_terminal() and p >= 0 and ml < COLLAPSE_MUTATIONS * om and (
+        if collapse and n is not tree.root and not n.is_terminal() and p >= 0 and ml < COLLAPSE_MUTATIONS * om and (
                 pos is None or len(pos) == 0):
             for c in reversed(n.clades):  # collapse: children attach to p, inheriting this edge
                 stack.append((c, p, ml, pos))
@@ -282,8 +287,8 @@ def _resolve_restricted(A, tp, T, K, tiny, thr, neighbours):
     (count 0) enters the order at its own time and is paired with its
     neighbours; across the gap a removed node leaves, the nodes within the
     window on either side are paired. O(m neighbours^2 log m). On simulated
-    polytomies of 100-400 children it reaches 98-100% of the exact greedy's
-    total gain."""
+    polytomies of 100-1000 children it reaches 98-102% of the exact greedy's
+    total gain (the greedy is not optimal either)."""
     import bisect
     import heapq
     T, K = [float(z) for z in T], [float(z) for z in K]
@@ -398,6 +403,16 @@ def _resolve(f, mu, L, max_exact, neighbours):
 # regression on the copy
 
 
+def _postorder_Q(treg):
+    """Root averages of a TreeRegression by its postorder recursion alone, O(n)."""
+    for nd in treg.tree.get_nonterminals(order='postorder'):
+        Q = np.zeros(6)
+        for c in nd:
+            Q += treg.propagate_averages(c, treg.tip_value(c), treg.branch_value(c), treg.branch_variance(c))
+        nd.Q = Q
+    return treg.tree.root.Q
+
+
 class _Regression:
     """TreeRegression on a light Bio.Phylo copy of a flat tree, with the
     branch values and variances supplied as arrays per fit. Only the
@@ -421,17 +436,10 @@ class _Regression:
         self.treg = TreeRegression(self.tree, tip_value=tipval,
                                    branch_value=lambda c: self.cur['val'][c._i],
                                    branch_variance=lambda c: self.cur['var'][c._i])
-        self.post = self.tree.get_nonterminals(order='postorder')
 
     def averages(self, val, var):
         self.cur['val'], self.cur['var'] = val, var
-        tr = self.treg
-        for nd in self.post:
-            Q = np.zeros(6)
-            for c in nd:
-                Q += tr.propagate_averages(c, tr.tip_value(c), tr.branch_value(c), tr.branch_variance(c))
-            nd.Q = Q
-        return self.tree.root.Q
+        return _postorder_Q(self.treg)
 
     def fit(self, val, var, slope=None):
         return base_regression(self.averages(val, var), slope=slope)
@@ -450,7 +458,8 @@ def _xfit(reg, ml, k, splits, L, floor, weight_iterations, tip_extra=0.0):
     """Cross-fitted slopes on the flat tree behind ``reg``. ``splits``: list of
     (kA, LA), the per-branch counts in half A and its number of columns.
     For each split and direction the weight half is fitted
-    ``weight_iterations`` times (first unweighted, then with the variances
+    ``weight_iterations`` times (first with constant branch variances plus the
+    tip term, then with the variances
     from the previous fit's predicted branch lengths l_b: (l_b L + floor)/L^2),
     and the other half's values are regressed with the final variances.
     ``tip_extra`` (mutations) is added to the variance of terminal branches.
@@ -483,7 +492,7 @@ def _xfit(reg, ml, k, splits, L, floor, weight_iterations, tip_extra=0.0):
 
 
 def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations=3, resolve=True,
-                            max_exact_polytomy=1000, neighbours=8, counts=None, tip_slack=0.0):
+                            max_exact_polytomy=1000, neighbours=8, counts=None, tip_slack=0.0, collapse=True):
     """Clock rate at the current root of ``tt`` (a ClockTree/TreeTime with
     branch ``mutation_length`` set): covariation regression on a date-resolved
     copy of the tree with cross-fitted branch weights. ``tt.tree`` is not
@@ -515,19 +524,26 @@ def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations
         weight, as TreeTime's covariation regression has (default 0: none).
     counts : {None, 'mutations', 'thinned'}
         Source of the per-half counts. None: mutation positions when ``tt``
-        has an alignment and a reconstruction, else thinning.
+        has an alignment and a reconstruction (branches whose node has no
+        reconstructed sequence are thinned, with a warning), else thinning.
+    collapse : bool
+        Collapse internal edges with no mutation and length < 0.1 mutations
+        on the copy before resolving (default). Without it such edges keep
+        their length and are not re-resolved.
 
     Returns
     -------
     DateResolvedRate
-        rate, rate_se (GLS standard error at the averaged cross-fitted
-        variances, root and topology fixed; ``se_kind``), split_rates and
+        rate, rate_se (model-based GLS standard error at the averaged
+        cross-fitted variances, root and topology fixed; ``se_kind``; it
+        ignores overdispersion, tip-date errors and the cross-fitting, and
+        undercovers on misspecified data), split_rates and
         split_sd (spread over the 2R half fits, split noise only), intercept and
         root_date (refitted on all values at ``rate``), cov, chisq, r_val,
         plain_rate / plain_intercept (reference), covariation_rate /
         covariation_intercept (TreeTime's own covariation regression on the
         tree as given, with its tip_slack and branch_variance_floor), counts
-        ('mutations' or 'thinned'), resolution info (n_polytomies,
+        ('mutations', 'mixed' or 'thinned'), n_thinned_branches, resolution info (n_polytomies,
         n_polytomies_left, n_new_nodes, n_restricted, max_polytomy,
         resolution_skipped), seconds.
     """
@@ -540,28 +556,44 @@ def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations
     om = 1.0 / L
     rng = np.random.default_rng(seed)
 
-    positions = None
-    if counts in (None, 'mutations'):
-        ok = tt.aln is not None and getattr(tt, 'sequence_reconstruction', None)
-        if ok:
-            try:
-                positions = {id(nd): np.array([m[1] for m in nd.mutations], dtype=int)
-                             for nd in tt.tree.find_clades() if nd.up is not None}
-            except (AttributeError, TypeError, KeyError):
-                positions = None
-        if positions is None and counts == 'mutations':
-            raise ValueError('date_resolved_xfit: no mutation positions (run ancestral reconstruction first)')
-    elif counts != 'thinned':
+    if counts not in (None, 'mutations', 'thinned'):
         raise ValueError("date_resolved_xfit: counts must be None, 'mutations' or 'thinned'")
+    if tip_slack < 0:
+        raise ValueError('date_resolved_xfit: tip_slack must be >= 0')
+    positions, n_thinned = None, 0
+    if counts != 'thinned' and tt.aln is not None:
+        # nodes created after the reconstruction (a new root edge from rerooting, TreeTime's own polytomy
+        # resolution) have no sequence yet: those branches alone are thinned (pos None). TreeTime flags the
+        # whole reconstruction stale after a reroot (sequence_reconstruction = False), but the branches the
+        # reroot did not touch keep their mutations, so the flag is not used here.
+        positions = {}
+        for nd in tt.tree.find_clades():
+            if nd.up is None:
+                continue
+            try:
+                p = np.array([m[1] for m in nd.mutations], dtype=int)
+                positions[id(nd)] = p[(p >= 0) & (p < L)]
+            except (AttributeError, TypeError, KeyError, ValueError):
+                positions[id(nd)] = None
+                n_thinned += 1
+        if n_thinned == len(positions):
+            positions, n_thinned = None, 0
+        elif n_thinned:
+            tt.logger('date_resolved_xfit: %d branches without reconstructed mutations; their per-half counts are '
+                      'binomial thinnings' % n_thinned, 1, warn=True)
+    if positions is None and counts == 'mutations':
+        raise ValueError('date_resolved_xfit: no mutation positions (run ancestral reconstruction first)')
 
-    # TreeTime's own covariation regression on the tree as given (diagnostic)
+    # TreeTime's own covariation regression on the tree as given (diagnostic). Only the postorder half of the
+    # recursion: TreeRegression.regression() also runs a preorder pass that is quadratic in polytomy size.
     try:
-        cov_model = tt.setup_TreeRegression(covariation=True).regression()
+        treg = tt.setup_TreeRegression(covariation=True)
+        cov_model = base_regression(_postorder_Q(treg))
         cov_rate, cov_icpt = float(cov_model['slope']), float(cov_model['intercept'])
     except ValueError:
         cov_rate = cov_icpt = np.nan
 
-    f = _flatten(tt.tree, om, positions)
+    f = _flatten(tt.tree, om, positions, collapse=collapse)
     plain_rate, plain_icpt, r_val = _plain_regression(f)
     info = dict(n_polytomies=0, n_polytomies_left=0, n_new_nodes=0, n_restricted=0, max_polytomy=0)
     skipped = None
@@ -570,30 +602,31 @@ def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations
             f, info = _resolve(f, plain_rate, L, max_exact_polytomy, neighbours)
         else:
             skipped = 'plain regression rate not positive'
+    if skipped or not resolve:
+        info['n_polytomies'] = info['n_polytomies_left'] = sum(len(c) > 2 for c in f.children())
     info['resolution_skipped'] = skipped
+    info['n_thinned_branches'] = int(n_thinned)
 
     n = len(f.par)
     ml = np.asarray(f.ml, float)
     reg = _Regression(f)
 
     # full counts and per-split half counts
-    if positions is not None:
-        k = np.array([0.0] + [float(len(f.pos[v])) for v in range(1, n)])
-        source = 'mutations'
-    else:
-        k = np.round(ml * L)
-        source = 'thinned'
+    has_pos = np.array([positions is not None and v > 0 and f.pos[v] is not None for v in range(n)])
+    k = np.round(ml * L)
+    for v in np.flatnonzero(has_pos):
+        k[v] = float(len(f.pos[v]))
     k[0] = 0.0
+    source = 'thinned' if not has_pos.any() else ('mutations' if has_pos[1:].all() else 'mixed')
 
     splits = []
     for _ in range(n_splits):
         inA = np.zeros(L, bool)
         inA[rng.permutation(L)[: L // 2]] = True
         LA = float(inA.sum())
-        if positions is not None:
-            kA = np.array([0.0] + [float(inA[f.pos[v]].sum()) if len(f.pos[v]) else 0.0 for v in range(1, n)])
-        else:
-            kA = rng.binomial(k.astype(int), LA / L).astype(float)
+        kA = np.zeros(n) if has_pos[1:].all() else rng.binomial(k.astype(int), LA / L).astype(float)
+        for v in np.flatnonzero(has_pos):
+            kA[v] = float(inA[f.pos[v]].sum()) if len(f.pos[v]) else 0.0
         splits.append((kA, LA))
     slopes, var_bar = _xfit(reg, ml, k, splits, L, floor, weight_iterations, tip_extra=float(tip_slack) ** 2)
     rate = float(np.mean(slopes))

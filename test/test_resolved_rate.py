@@ -327,6 +327,8 @@ def test_hook_sets_the_clock_model_and_leaves_the_tree():
     shape = [len(n.clades) for n in tt.tree.find_clades()]
     tt.clock_rate_method = 'date_resolved_xfit'
     tt.get_clock_model(covariation=False)
+    assert not tt.clock_model['valid_confidence'] and 'cov' not in tt.clock_model  # as the regression path
+    tt.get_clock_model(covariation=True)
     cm = tt.clock_model
     est = rr.date_resolved_xfit_rate(tt)
     assert cm['slope'] == est['rate'] and cm['intercept'] == est['intercept']
@@ -356,3 +358,142 @@ def test_run_with_the_method_end_to_end():
     tt.run(root='least-squares', max_iter=1, branch_length_mode='input', resolve_polytomies=False)
     assert 'date_resolved_xfit' in tt.clock_model and tt.clock_model['slope'] > 0
     assert tt.clock_model['date_resolved_xfit']['counts'] == 'mutations'
+
+
+# ---------------------------------------------------------------- against an independent dense implementation
+
+
+def dense_xfit(f, splits, L, floor, iters, tip_extra=0.0):
+    """Report 85's est_xfit recipe written with a dense design matrix: branch least squares with the
+    internal node positions x and the rate mu as unknowns (dated tip c: x_c = mu t_c), weights
+    1 / (max(predicted length, 0) L + floor [+ tip_extra on tips]); the first weight fit has constant
+    variances plus the tip term.
+    Returns the 2R slopes, the mean variance vector and the design pieces."""
+    par, tip, d, ml = (np.asarray(z) for z in (f.par, f.tip, f.date, f.ml))
+    n = len(par)
+    free = [v for v in range(n) if not (tip[v] and np.isfinite(d[v]))]
+    col = {v: i for i, v in enumerate(free)}
+    X = np.zeros((n - 1, len(free) + 1))
+    for r, c in enumerate(range(1, n)):
+        if c in col:
+            X[r, col[c]] += 1
+        else:
+            X[r, -1] += d[c]
+        X[r, col[par[c]]] -= 1
+    k = np.round(ml * L)
+    extra = np.where(tip[1:], tip_extra, 0.0)
+
+    def wls(y, w):
+        sw = np.sqrt(w)
+        return np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)[0]
+
+    slopes, vs = [], []
+    for kA, LA in splits:
+        vA = np.where(k > 0, ml * kA / np.where(k > 0, k, 1) * L / LA, ml)[1:]
+        vB = np.where(k > 0, ml * (k - kA) / np.where(k > 0, k, 1) * L / (L - LA), ml)[1:]
+        for src, dst in ((vA, vB), (vB, vA)):
+            w = 1.0 / (1.0 + extra)
+            for _ in range(iters):
+                lam = X @ wls(src, w)
+                w = 1.0 / (np.maximum(lam, 0) * L + floor + extra)
+            slopes.append(wls(dst, w)[-1])
+            vs.append(1.0 / w)
+    return slopes, np.mean(vs, 0), X, col
+
+
+def test_cross_fit_matches_a_dense_implementation_of_the_recipe():
+    """Weighting, cross-fitting (weights from one half, slope from the other), the floor and the tip
+    term all enter: a version without any of them does not match."""
+    tree, dates = sim(40, seed=9)
+    f = flat_from(tree, dates)
+    reg = rr._Regression(f)
+    ml = np.asarray(f.ml)
+    k = np.round(ml * L)
+    rng = np.random.default_rng(3)
+    splits = [(rng.binomial(k.astype(int), 0.5).astype(float), L / 2) for _ in range(2)]
+    for floor, iters, extra in ((0.5, 3, 0.0), (2.0, 1, 0.0), (0.5, 3, 9.0)):
+        got, _ = rr._xfit(reg, ml, k, splits, L, floor, iters, tip_extra=extra)
+        ref, _, _, _ = dense_xfit(f, splits, L, floor, iters, tip_extra=extra)
+        assert np.allclose(got, ref, rtol=1e-8), (floor, iters, extra)
+    # sanity: the recipe is sensitive to what the test claims to pin
+    a, _, _, _ = dense_xfit(f, splits, L, 0.5, 3)
+    b, _, _, _ = dense_xfit(f, splits, L, 0.5, 0)
+    c, _, _, _ = dense_xfit(f, splits, L, 1e-6, 3)
+    assert not np.allclose(a, b, rtol=1e-3) and not np.allclose(a, c, rtol=1e-3)
+
+
+def test_rate_and_root_date_end_to_end_against_the_dense_recipe():
+    """date_resolved_xfit_rate on a tree without polytomies, thinned counts: the same column splits
+    drawn by hand give the same rate; the root date is the GLS refit on all values at that rate
+    (not a mean of half-sample root dates)."""
+    tree, dates = sim(50, seed=10, internal_min=1)
+    tt = tt_from_tree(tree, dates)
+    est = rr.date_resolved_xfit_rate(tt, seed=21, n_splits=3)
+    f = rr._flatten(tt.tree, 1.0 / L, None)
+    ml = np.asarray(f.ml)
+    k = np.round(ml * L)
+    k[0] = 0
+    rng = np.random.default_rng(21)
+    splits = []
+    for _ in range(3):
+        LA = float(L // 2)
+        rng.permutation(L)
+        splits.append((rng.binomial(k.astype(int), LA / L).astype(float), LA))
+    slopes, vbar, X, col = dense_xfit(f, splits, L, 0.5, 3)
+    assert est['rate'] == pytest.approx(np.mean(slopes), rel=1e-8)
+    # root date: weighted LS of all values with the slope fixed at the rate
+    mu = est['rate']
+    y = ml[1:] - mu * X[:, -1]
+    w = 1.0 / vbar
+    sw = np.sqrt(w)
+    x = np.linalg.lstsq(X[:, :-1] * sw[:, None], y * sw, rcond=None)[0]
+    assert est['root_date'] == pytest.approx(x[col[0]] / mu, abs=1e-6)
+
+
+def test_mutation_positions_set_the_half_counts():
+    """With a reconstruction, the half counts come from the mutated columns: the rate equals a
+    hand-built cross-fit over the same column permutations, and differs from the thinned estimate."""
+    nwk, aln, dates = fixture('poly20')
+    tt = TreeTime(tree=nwk, aln=aln, dates=dates, verbose=0, gtr='JC69', rng_seed=1)
+    tt.infer_ancestral_sequences('probabilistic', marginal=False)
+    tt.reroot('least-squares')
+    tt.infer_ancestral_sequences('probabilistic', marginal=False)
+    est = rr.date_resolved_xfit_rate(tt, seed=5, n_splits=2, resolve=False)
+    assert est['counts'] == 'mutations' and est['n_thinned_branches'] == 0
+    L_ = tt.data.full_length
+    pos = {id(n): np.array([m[1] for m in n.mutations], int) for n in tt.tree.find_clades() if n.up is not None}
+    f = rr._flatten(tt.tree, 1.0 / L_, pos)
+    ml = np.asarray(f.ml)
+    k = np.array([0.0] + [float(len(f.pos[v])) for v in range(1, len(f.par))])
+    rng = np.random.default_rng(5)
+    splits = []
+    for _ in range(2):
+        inA = np.zeros(L_, bool)
+        inA[rng.permutation(L_)[: L_ // 2]] = True
+        splits.append((np.array([0.0] + [float(inA[f.pos[v]].sum()) for v in range(1, len(f.par))]), float(inA.sum())))
+    slopes, _ = rr._xfit(rr._Regression(f), ml, k, splits, L_, 0.5, 3)
+    assert est['rate'] == pytest.approx(np.mean(slopes), rel=1e-12)
+    assert est['rate'] != rr.date_resolved_xfit_rate(tt, seed=5, n_splits=2, resolve=False, counts='thinned')['rate']
+
+
+def test_nodes_without_sequences_are_thinned_alone():
+    """After rerooting at a tip, the new root-edge node has no reconstructed sequence: only that
+    branch is thinned, the rest keep their mutation counts."""
+    nwk, aln, dates = fixture('poly20')
+    tt = TreeTime(tree=nwk, aln=aln, dates=dates, verbose=0, gtr='JC69', rng_seed=1)
+    tt.infer_ancestral_sequences('probabilistic', marginal=False)
+    tt.reroot('oldest')
+    est = rr.date_resolved_xfit_rate(tt)
+    assert est['counts'] in ('mixed', 'mutations')
+    assert est['n_thinned_branches'] <= 2
+
+
+def test_non_positive_estimate_falls_back_to_the_regression():
+    tree, dates = star(8)
+    dates = {kk: (4030.0 - v) for kk, v in dates.items()}
+    tt = tt_from_tree(tree, dates)
+    tt.clock_rate_method = 'date_resolved_xfit'
+    tt.get_clock_model(covariation=True)
+    ref = tt.setup_TreeRegression(covariation=True).regression()
+    if 'date_resolved_xfit' not in tt.clock_model:
+        assert tt.clock_model['slope'] == ref['slope']
