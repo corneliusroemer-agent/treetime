@@ -224,3 +224,27 @@ def test_interval_and_flag_reach_the_headline():
     off = rank_root_candidates(b, regression_k=2, fit=FIT1, keep_states=False, final_lsdv=False,
                                candidate_sources=plain_candidate_sources(2))
     assert off.headline_root_date_ci is None and off.date_reliable is None
+
+
+def test_headline_falls_back_to_the_fit_when_final_lsdv_fails(monkeypatch):
+    from test_lsdv import FIT1
+    from treetime.root_candidates import UnrootedBaseline, plain_candidate_sources, rank_root_candidates
+    b = _b()
+
+    def boom(self, cand, **kw):
+        raise ValueError('ls_dated_variance_rate: reference rate not positive')
+    monkeypatch.setattr(UnrootedBaseline, 'lsdv', boom)
+    res = rank_root_candidates(b, regression_k=2, fit=FIT1, keep_states=False,
+                               candidate_sources=plain_candidate_sources(2))
+    assert res.final_lsdv['error'] and res.headline_source == 'fit'
+    assert res.headline_root_date == res.best.best_run.root['root_date'] and res.headline_root_date_ci is None
+    assert res.date_reliable is None and res.summary()['headline_source'] == 'fit'
+
+
+def test_resampling_with_priors_and_range_dates():
+    f = flat(80, seed=2)
+    g, _ = _year_only(f, [3, 10, 20])
+    base = ld.lsdv_flat(g, L)
+    o = ld.lsdv_flat(g, L, resample=20, root_date_prior=(base['root_date'] - 5.0, np.log(1.5)))
+    rs = o['resample']
+    assert rs['n_ok'] >= 15 and rs['root_date_ci'][0] <= o['root_date'] <= rs['root_date_ci'][1]

@@ -1067,7 +1067,9 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
       on the slope of the GLS fit, linearised at the median and weighted
       against the curvature of the SE-inflated fit (report 113). It also
       stabilises the reference rate (plain slope combined with the prior),
-      so a non-positive plain slope no longer stops the fit. The outlier rule
+      so a non-positive plain slope no longer stops the fit; the fitted rate
+      itself can still come out non-positive when the data outweigh the prior
+      (``root_date_prior`` acts on the log scale and keeps it positive). The outlier rule
       runs before it and never sees it. Reported: ``rate_prior``,
       ``prior_share`` (the prior's share of the slope precision),
       ``gls_rate`` and ``gls_root_date`` (the fit without priors); ``cov``,
@@ -1081,7 +1083,9 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
       become negative; the covariance is the inverse Hessian at the mode
       (Gauss-Newton term for the age prior). Reported:
       ``root_date_prior``, ``root_date_prior_share`` (the prior's share of the
-      root-date precision), ``root_date_prior_t_ref``.
+      root-date precision), ``root_date_prior_t_ref``. With 'ladder_xo' the
+      rate and root date are the cross-fit averages, while ``gls_*`` and the
+      prior shares are those of the member fit closest to the average.
     - ``root_date_ci_factor``: factor k of the root-date interval
       ``root_date_ci`` = root_date +- 1.96 x k x root_date_se (1.5). The
       delta-method SE alone under-covers; report 114 found that 95% coverage
