@@ -446,31 +446,33 @@ def _half_values(ml, k, kh, Lh, L):
     return v
 
 
-def _xfit(reg, ml, k, splits, L, floor, weight_iterations):
+def _xfit(reg, ml, k, splits, L, floor, weight_iterations, tip_extra=0.0):
     """Cross-fitted slopes on the flat tree behind ``reg``. ``splits``: list of
     (kA, LA), the per-branch counts in half A and its number of columns.
     For each split and direction the weight half is fitted
     ``weight_iterations`` times (first unweighted, then with the variances
     from the previous fit's predicted branch lengths l_b: (l_b L + floor)/L^2),
     and the other half's values are regressed with the final variances.
+    ``tip_extra`` (mutations) is added to the variance of terminal branches.
     Returns (2R slopes, mean variance vector over the 2R weight fits)."""
     f = reg.f
     par, tip = np.asarray(f.par), np.asarray(f.tip)
     dates = np.asarray(f.date, float)
     n, om = len(par), 1.0 / L
     dated = tip & np.isfinite(dates)
+    extra = np.where(tip, tip_extra, 0.0)
 
     def predicted_variance(val, var):
         mu = reg.fit(val, var)['slope']
         x = _node_positions(par, tip, np.where(dated, mu * dates, np.nan), val, 1.0 / var)
         lhat = np.r_[0.0, x[1:] - x[par[1:]]]
-        return (np.maximum(lhat, 0.0) * L + floor) * om * om
+        return (np.maximum(lhat, 0.0) * L + floor + extra) * om * om
 
     slopes, var_sum = [], np.zeros(n)
     for kA, LA in splits:
         halves = (_half_values(ml, k, kA, LA, L), _half_values(ml, k, k - kA, L - LA, L))
         for src, dst in ((0, 1), (1, 0)):
-            var = np.full(n, om * om)
+            var = np.full(n, om * om) + extra * om * om
             for _ in range(weight_iterations):
                 var = predicted_variance(halves[src], var)
             slopes.append(float(reg.fit(halves[dst], var)['slope']))
@@ -481,7 +483,7 @@ def _xfit(reg, ml, k, splits, L, floor, weight_iterations):
 
 
 def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations=3, resolve=True,
-                            max_exact_polytomy=1000, neighbours=8, counts=None):
+                            max_exact_polytomy=1000, neighbours=8, counts=None, tip_slack=0.0):
     """Clock rate at the current root of ``tt`` (a ClockTree/TreeTime with
     branch ``mutation_length`` set): covariation regression on a date-resolved
     copy of the tree with cross-fitted branch weights. ``tt.tree`` is not
@@ -508,6 +510,9 @@ def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations
         about 0.3 s at m = 800.
     neighbours : int
         Width of the attachment-time window of the restricted join.
+    tip_slack : float
+        Extra variance tip_slack^2 (mutations) on terminal branches in every
+        weight, as TreeTime's covariation regression has (default 0: none).
     counts : {None, 'mutations', 'thinned'}
         Source of the per-half counts. None: mutation positions when ``tt``
         has an alignment and a reconstruction, else thinning.
@@ -590,7 +595,7 @@ def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations
         else:
             kA = rng.binomial(k.astype(int), LA / L).astype(float)
         splits.append((kA, LA))
-    slopes, var_bar = _xfit(reg, ml, k, splits, L, floor, weight_iterations)
+    slopes, var_bar = _xfit(reg, ml, k, splits, L, floor, weight_iterations, tip_extra=float(tip_slack) ** 2)
     rate = float(np.mean(slopes))
     full_free = reg.fit(ml, var_bar)
     at_rate = reg.fit(ml, var_bar, slope=rate)
@@ -612,6 +617,7 @@ def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations
         covariation_intercept=cov_icpt,
         counts=source,
         floor=float(floor),
+        tip_slack=float(tip_slack),
         n_splits=int(n_splits),
         seed=seed,
         n_nodes=int(n),
