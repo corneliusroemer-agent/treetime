@@ -497,3 +497,81 @@ def test_non_positive_estimate_falls_back_to_the_regression():
     ref = tt.setup_TreeRegression(covariation=True).regression()
     if 'date_resolved_xfit' not in tt.clock_model:
         assert tt.clock_model['slope'] == ref['slope']
+
+
+# ls_dated_variance_rate (lsdv): covariation regression with variances from least-squares-dated durations
+
+
+def dense_ls_durations(f, mu):
+    """Independent version of _ls_durations: dense least squares for the free node positions."""
+    par, tip = np.asarray(f.par), np.asarray(f.tip)
+    dates, ml = np.asarray(f.date, float), np.asarray(f.ml, float)
+    n = len(par)
+    fixed = tip & np.isfinite(dates)
+    free = np.flatnonzero(~fixed)
+    col = {v: i for i, v in enumerate(free)}
+    A, y = np.zeros((n - 1, len(free))), np.zeros(n - 1)
+    for r, v in enumerate(range(1, n)):  # ml_v = x_v - x_par
+        y[r] = ml[v]
+        for node, sgn in ((v, 1.0), (par[v], -1.0)):
+            if fixed[node]:
+                y[r] -= sgn * mu * dates[node]
+            else:
+                A[r, col[node]] += sgn
+    x = np.where(fixed, mu * dates, 0.0)
+    x[free] = np.linalg.lstsq(A, y, rcond=None)[0]
+    t = x / mu
+    eps = 1e-6 * np.ptp(dates[fixed])
+    for v in range(n - 1, 0, -1):
+        t[par[v]] = min(t[par[v]], t[v] - eps)
+    return np.maximum(np.r_[0.0, mu * (t[1:] - t[par[1:]])], 0.0)
+
+
+def test_ls_durations_match_dense_least_squares():
+    tree, dates = sim(40, seed=5, internal_min=1)
+    f = flat_from(tree, dates)
+    mu = rr._plain_regression(f)[0]
+    assert np.allclose(rr._ls_durations(f, mu), dense_ls_durations(f, mu), atol=1e-12)
+
+
+def test_lsdv_equals_treetime_covariation_regression_with_clock_length_set():
+    tree, dates = sim(50, seed=3, internal_min=1)
+    tt = tt_from_tree(tree, dates)
+    est = rr.ls_dated_variance_rate(tt, tip_slack=3.0, collapse=False)
+    # same durations as clock_length on TreeTime's own tree, TreeTime's own regression
+    f = rr._flatten(tt.tree, 1.0 / L, None, collapse=False)
+    d = dense_ls_durations(f, est['plain_rate'])
+    by_name = dict(zip(f.name, d))
+    named = [n for n in tt.tree.find_clades() if n.up is not None]
+    assert all(n.name in by_name for n in named)
+    for n in named:
+        n.clock_length = by_name[n.name]
+    tt.tip_slack, tt.branch_variance_floor = 3.0, None
+    r = tt.setup_TreeRegression(covariation=True).regression()
+    assert est['rate'] == pytest.approx(r['slope'], rel=1e-9)
+    assert est['intercept'] == pytest.approx(r['intercept'], rel=1e-9, abs=1e-12)
+
+
+def test_lsdv_rounds_and_reference_rate():
+    tree, dates = sim(60, seed=2)
+    tt = tt_from_tree(tree, dates)
+    one = rr.ls_dated_variance_rate(tt)
+    two = rr.ls_dated_variance_rate(tt, rounds=2)
+    assert two['round_rates'][0] == pytest.approx(one['rate'], rel=1e-12)
+    again = rr.ls_dated_variance_rate(tt, rate=one['rate'])
+    assert again['rate'] == pytest.approx(two['rate'], rel=1e-12)
+    res = rr.ls_dated_variance_rate(tt, resolve=True)
+    assert res['n_new_nodes'] >= 0 and res['rate'] > 0
+    with pytest.raises(ValueError):
+        rr.ls_dated_variance_rate(tt, rate=-1.0)
+
+
+def test_lsdv_outlier_tip_carries_no_date():
+    tree, dates = sim(40, seed=4, internal_min=1)
+    tt = tt_from_tree(copy.deepcopy(tree), dates)
+    tip = tt.tree.get_terminals()[5]
+    tip.bad_branch = True
+    flagged = rr.ls_dated_variance_rate(tt)
+    d2 = {k: v for k, v in dates.items() if k != tip.name}
+    tt2 = tt_from_tree(copy.deepcopy(tree), d2)
+    assert flagged['rate'] == pytest.approx(rr.ls_dated_variance_rate(tt2)['rate'], rel=1e-12)

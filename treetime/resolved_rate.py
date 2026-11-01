@@ -658,3 +658,81 @@ def date_resolved_xfit_rate(tt, floor=0.5, n_splits=5, seed=0, weight_iterations
     )
     out['seconds'] = time.time() - t0
     return out
+
+
+# --------------------------------------------------------------------------------------------------------------
+# least-squares-dated variance (no TreeTime dated fit)
+
+
+def _ls_durations(f, mu):
+    """Branch durations (in substitution units, mu x time) from one unweighted
+    least-squares fit of the branch lengths with dated tips fixed at mu x date,
+    parents then moved no later than their children (the node times
+    ``_resolve`` uses). Element 0 (root) is 0."""
+    par = np.asarray(f.par)
+    tip = np.asarray(f.tip)
+    dates = np.asarray(f.date, float)
+    ml = np.asarray(f.ml, float)
+    fixed = np.where(tip & np.isfinite(dates), mu * dates, np.nan)
+    x = _node_positions(par, tip, fixed, ml, np.ones(len(par)))
+    t = x / mu
+    dated = dates[tip & np.isfinite(dates)]
+    span = float(np.ptp(dated)) if len(dated) > 1 else 1.0
+    eps = 1e-6 * max(span, 1e-12)
+    for v in range(len(par) - 1, 0, -1):
+        p = par[v]
+        if t[p] > t[v] - eps:
+            t[p] = t[v] - eps
+    d = np.r_[0.0, mu * (t[1:] - t[par[1:]])]
+    return np.maximum(d, 0.0)
+
+
+def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, resolve=False, collapse=True,
+                           max_exact_polytomy=1000, neighbours=8):
+    """Clock rate at the current root of ``tt`` from TreeTime's covariation
+    regression with dated-duration variances, where the durations come from a
+    least-squares node-time solve instead of a dated fit (no ``make_time_tree``).
+
+    Branch values are ``mutation_length``; branch variances are
+    (duration + tip_slack^2 / L [terminal branches]) / L, TreeTime's
+    ``clock_length`` variance with its tip slack. Durations: ``_ls_durations``
+    at the reference rate (``rate``, default the plain root-to-tip rate), on the
+    flat copy (``collapse``: zero-mutation internal edges collapsed first;
+    ``resolve``: polytomies date-resolved at the reference rate first, as
+    ``date_resolved_xfit_rate`` does). ``rounds`` > 1 re-solves the node times at
+    the previous round's rate. Outlier tips (``bad_branch``) carry no date.
+
+    Returns a dict: rate, intercept, root_date, plain_rate, r_val, round_rates,
+    n_nodes, n_new_nodes, seconds.
+    """
+    t0 = time.time()
+    if tip_slack < 0:
+        raise ValueError('ls_dated_variance_rate: tip_slack must be >= 0')
+    L = int(tt.data.full_length)
+    om = 1.0 / L
+    f = _flatten(tt.tree, om, None, collapse=collapse)
+    plain_rate, plain_icpt, r_val = _plain_regression(f)
+    mu = plain_rate if rate is None else float(rate)
+    if not (mu > 0 and np.isfinite(mu)):
+        raise ValueError('ls_dated_variance_rate: reference rate not positive')
+    n_new = 0
+    if resolve:
+        f, info = _resolve(f, mu, L, max_exact_polytomy, neighbours)
+        n_new = info['n_new_nodes']
+    tip = np.asarray(f.tip)
+    ml = np.asarray(f.ml, float)
+    reg = _Regression(f)
+    extra = np.where(tip, float(tip_slack) ** 2 * om, 0.0)
+    round_rates = []
+    for _ in range(max(1, int(rounds))):
+        var = (_ls_durations(f, mu) + extra) * om
+        var[0] = om * om
+        r = reg.fit(ml, var)
+        slope, icpt = float(r['slope']), float(r['intercept'])
+        round_rates.append(slope)
+        if not slope > 0:
+            break
+        mu = slope
+    return dict(rate=slope, intercept=icpt, root_date=(-icpt / slope) if slope > 0 else np.nan,
+                plain_rate=plain_rate, r_val=r_val, round_rates=round_rates, n_nodes=len(f.par), n_new_nodes=n_new,
+                seconds=time.time() - t0)
