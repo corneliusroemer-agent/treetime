@@ -575,3 +575,28 @@ def test_lsdv_outlier_tip_carries_no_date():
     d2 = {k: v for k, v in dates.items() if k != tip.name}
     tt2 = tt_from_tree(copy.deepcopy(tree), d2)
     assert flagged['rate'] == pytest.approx(rr.ls_dated_variance_rate(tt2)['rate'], rel=1e-12)
+
+
+def test_lsdv_default_reference_rate_is_treetime_plain_regression():
+    tree, dates = sim(50, seed=6)
+    tt = tt_from_tree(tree, dates)
+    est = rr.ls_dated_variance_rate(tt)
+    plain = tt.setup_TreeRegression(covariation=False).regression()['slope']
+    assert est['plain_rate'] == pytest.approx(plain, rel=1e-9)
+    assert rr.ls_dated_variance_rate(tt, rate=plain)['rate'] == pytest.approx(est['rate'], rel=1e-12)
+
+
+def test_lsdv_collapse_and_resolve_change_the_copy():
+    tree, dates = sim(60, seed=2)  # internal_min=0: zero-count internal edges exist
+    tt = tt_from_tree(tree, dates)
+    nc = rr.ls_dated_variance_rate(tt, collapse=False)
+    co = rr.ls_dated_variance_rate(tt)
+    n_zero = sum(1 for n in tt.tree.get_nonterminals() if n.up is not None and n.mutation_length == 0)
+    assert n_zero > 0
+    assert nc['n_nodes'] - co['n_nodes'] == n_zero
+    stree, sdates = star(12)  # a polytomy the resolver joins (see the known-polytomy test)
+    stt = tt_from_tree(stree, sdates)
+    sco = rr.ls_dated_variance_rate(stt)
+    sre = rr.ls_dated_variance_rate(stt, resolve=True)
+    assert sre['n_new_nodes'] >= 5 and sre['n_nodes'] == sco['n_nodes'] + sre['n_new_nodes']
+    assert sre['rate'] != sco['rate']
