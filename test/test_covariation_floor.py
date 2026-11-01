@@ -183,3 +183,27 @@ def dense_gls_split(tt, mid, lower, x, floor):
     beta = np.linalg.solve(X.T @ Ci @ X, X.T @ Ci @ d)
     r = d - X @ beta
     return beta[0], beta[1], 0.5 * r @ Ci @ r
+
+
+def test_negative_floor_rejected():
+    tt = make_tt()
+    tt.branch_variance_floor = -1.0
+    with pytest.raises(ValueError):
+        tt.setup_TreeRegression(covariation=True)
+
+
+def test_regression_source_carries_floor():
+    """End to end on a root_candidates fixture: floor None equals the default source; a floor reaches the
+    regression through RegressionSource and regression_candidates and changes the objective."""
+    from test_root_candidates import make_baseline
+    from treetime.root_candidates import RegressionSource, regression_candidates
+    b = make_baseline('binary20')
+    kw = dict(covariation=True, tip_slack=3.0, slope=None)
+    base = regression_candidates(b, k=5, **kw)
+    assert regression_candidates(b, k=5, branch_variance_floor=None, **kw) == base
+    fl = regression_candidates(b, k=5, branch_variance_floor=3.0, **kw)
+    src = RegressionSource('cov', 5, branch_variance_floor=3.0, **kw).candidates(b)
+    assert [c for c, _ in src] == [c for c, _ in fl]
+    assert [i['regression_chisq'] for _, i in fl] != [i['regression_chisq'] for _, i in base]
+    treg = b.regression(covariation=True, tip_slack=3.0, branch_variance_floor=3.0)
+    assert fl[0][1]['regression_chisq'] == treg.rank_roots(force_positive=True, slope=None)[0]['edge_chisq']

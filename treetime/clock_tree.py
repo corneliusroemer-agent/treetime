@@ -283,6 +283,8 @@ class ClockTree(TreeAnc):
         branch_value = lambda x: x.mutation_length
         if covariation:
             om = self.one_mutation
+            if self.branch_variance_floor is not None and self.branch_variance_floor < 0:
+                raise ValueError('branch_variance_floor must be >= 0 (mutations)')
             floor = self.branch_variance_floor * om if self.branch_variance_floor else 0.0
             branch_variance = lambda x: (
                 (
