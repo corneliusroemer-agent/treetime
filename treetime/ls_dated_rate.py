@@ -13,11 +13,15 @@ At a given root:
 3. Covariation regression with branch variance
    (duration + tip_slack^2 / L [terminal branches]) / L. This is TreeTime's
    ``setup_TreeRegression(covariation=True)`` with ``clock_length`` set to the
-   durations, so the result equals that regression.
+   durations, so the result equals that regression on the tree the estimator
+   works on.
 
-Internal edges without mutations and shorter than 0.1 mutations are collapsed
-first (``collapse``), as their length is pushed onto the children; every
-root-to-tip distance is kept. The tree passed in is never modified.
+Internal edges shorter than 0.1 mutations are collapsed first (``collapse``,
+default), their length pushed onto the children; every root-to-tip distance is
+kept. With collapsing the equality above holds for TreeTime's regression on the
+collapsed tree; TreeTime's regression on the uncollapsed tree (with LS durations
+solved there) differs slightly, 0.1-0.2% in rate on simulated 80-tip trees.
+The tree passed in is never modified.
 
 Cost is linear in the number of nodes (the postorder half of TreeRegression's
 recursion only), about 1.5 ms at 80 tips and 15 ms at 1000 tips.

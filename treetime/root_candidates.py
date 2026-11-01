@@ -135,6 +135,11 @@ class UnrootedBaseline:
     shared_rate_kwargs : dict, optional
         Options of the lsdv rate (``tip_slack``, default 3; ``rounds``,
         default 1; ``collapse``, default True).
+
+    The shared rate also sets the slope of the plain regression source
+    (``RegressionSource(slope='fixed')``, in the default Stage 1 shortlist),
+    so with ``shared_rate='lsdv'`` that list can differ too; the covariation
+    source fits its own slope and is unaffected.
     optimize_baseline : bool
         Re-estimate branch lengths once with TreeTime's marginal optimiser on
         the unrooted tree, as ``TreeTime.run`` does before rerooting. These
@@ -147,9 +152,9 @@ class UnrootedBaseline:
 
     Attributes: ``clock_rate``; ``shared_rate_info`` (None for the default
     regression rate or a given ``clock_rate``; for ``'lsdv'`` a dict with the
-    rate used, the regression slope, the per-placement lsdv rates and their
-    spread, ``log_range`` = log(max / min), a diagnostic of how strongly the
-    rate depends on the root).
+    rate used, the regression slope, the per-placement lsdv rates and, with
+    ``shared_rate_k`` > 1, their spread ``log_range`` = log(max / min), a
+    diagnostic of how strongly the rate depends on the root; None at k = 1).
     """
 
     def __init__(self, tree, aln, dates, gtr='JC69', clock_rate=None, optimize_baseline=True,
@@ -404,13 +409,17 @@ class UnrootedBaseline:
         t0 = time.time()
         if not (isinstance(k, int) and k >= 1):
             raise ValueError('UnrootedBaseline: shared_rate_k must be a positive integer')
+        bad = set(kwargs) - {'tip_slack', 'rounds', 'collapse'}
+        if bad or kwargs.get('tip_slack', 3.0) < 0 or kwargs.get('rounds', 1) < 1:
+            raise ValueError('UnrootedBaseline: invalid shared_rate_kwargs %s' % kwargs)
         rows = []
         for cand, info in regression_candidates(self, k=k, covariation=False, slope=None):
             row = {'candidate_id': self.candidate_id(cand), 'regression_rank': info['regression_rank'],
                    'lsdv_rate': None, 'plain_rate': None, 'root_date': None, 'error': None}
             try:
                 r = self.lsdv(cand, **kwargs)
-                row.update(lsdv_rate=r['rate'], plain_rate=r['plain_rate'], root_date=r['root_date'])
+                row.update(lsdv_rate=r['rate'], plain_rate=r['plain_rate'],
+                           root_date=r['root_date'] if r['rate'] > 0 else None)
                 if not r['rate'] > 0:
                     row['error'] = 'lsdv rate not positive'
             except (ValueError, FloatingPointError, ZeroDivisionError) as e:
@@ -421,7 +430,7 @@ class UnrootedBaseline:
                 'candidates': rows, 'n_ok': len(ok), 'fallback': None}
         if len(ok):
             info.update(rate=float(np.median(ok)), min=float(ok.min()), max=float(ok.max()),
-                        log_range=float(np.log(ok.max() / ok.min())))
+                        log_range=float(np.log(ok.max() / ok.min())) if k > 1 else None)
         else:
             info.update(rate=float(regression_rate), min=None, max=None, log_range=None,
                         fallback='no positive lsdv rate at the regression placements; regression slope used')
@@ -932,6 +941,10 @@ class LsdvSource:
         return self.candidates_and_expansions(baseline)[0]
 
     def candidates_and_expansions(self, baseline):
+        if self.rerank is not None and self.rerank < 1:
+            raise ValueError('LsdvSource: rerank must be >= 1 or None')
+        if self.k is not None and self.k < 1:
+            return [], []
         edges = _regression_edges(baseline, True, self.base_tip_slack, None)
         base = _distinct_placements(baseline, edges, self.rerank)
         pool = [(c, info['regression_rank']) for c, info in base]
@@ -1237,7 +1250,7 @@ class RootSearchResult:
             out['final_lsdv'] = dict(self.final_lsdv)
         sri = self.config.get('shared_rate_info')
         if sri is not None:
-            out['shared_rate_source'] = sri['source']
+            out['shared_rate_source'] = sri['source'] if not sri.get('fallback') else 'regression (lsdv fallback)'
             out['shared_rate_log_range'] = sri.get('log_range')
         return out
 

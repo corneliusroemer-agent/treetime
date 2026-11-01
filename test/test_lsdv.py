@@ -115,6 +115,27 @@ def test_lsdv_equals_treetime_covariation_regression_with_ls_clock_length(seed, 
     assert est['chisq'] == pytest.approx(r['chisq'], rel=1e-7)
 
 
+def test_lsdv_with_collapse_equals_treetime_regression_on_the_collapsed_tree():
+    tree, dates = sim(80, seed=2)  # internal_min=0: zero-count internal edges exist
+    est = ld.ls_dated_variance_rate(tt_from_tree(copy.deepcopy(tree), dates), tip_slack=3.0)
+    col = copy.deepcopy(tree)
+    short = [c for c in col.get_nonterminals() if c is not col.root and (c.branch_length or 0) < 0.1 / L]
+    assert short
+    for c in short:
+        col.collapse(c)  # children inherit the edge
+    tt = tt_from_tree(col, dates)
+    f = ld._flatten(tt.tree, 1.0 / L, collapse=False)
+    assert len(f.par) == est['n_nodes']
+    by_name = dict(zip(f.name, dense_ls_durations(f, est['plain_rate'])))
+    for x in tt.tree.find_clades():
+        if x.up is not None:
+            x.clock_length = by_name[x.name]
+    tt.tip_slack = 3.0
+    r = tt.setup_TreeRegression(covariation=True).regression()
+    assert est['rate'] == pytest.approx(r['slope'], rel=1e-9)
+    assert est['intercept'] == pytest.approx(r['intercept'], rel=1e-9, abs=1e-12)
+
+
 def test_lsdv_rounds_reference_rate_and_errors():
     tree, dates = sim(60, seed=2)
     tt = tt_from_tree(tree, dates)
@@ -209,6 +230,9 @@ def test_shared_rate_argument_checks():
         baseline('binary20', shared_rate='datp')
     with pytest.raises(ValueError):
         baseline('binary20', shared_rate='lsdv', shared_rate_k=0)
+    for bad in ({'tip_slack': -1.0}, {'rounds': 0}, {'resolve': True}):
+        with pytest.raises(ValueError):
+            baseline('binary20', shared_rate='lsdv', shared_rate_kwargs=bad)
 
 
 def test_lsdv_shared_rate_at_the_regression_best_and_median_over_top_k(b60):
@@ -217,7 +241,7 @@ def test_lsdv_shared_rate_at_the_regression_best_and_median_over_top_k(b60):
     assert b1.clock_rate == b60.lsdv(top)['rate']
     info = b1.shared_rate_info
     assert info['source'] == 'lsdv' and info['k'] == 1 and info['regression_rate'] == b60.clock_rate
-    assert info['log_range'] == 0.0 and info['fallback'] is None
+    assert info['log_range'] is None and info['fallback'] is None
     b5 = baseline('mixed60', shared_rate='lsdv', shared_rate_k=5)
     rates = [r['lsdv_rate'] for r in b5.shared_rate_info['candidates']]
     assert len(rates) == 5 and b5.clock_rate == pytest.approx(np.median(rates), rel=1e-15)
@@ -239,7 +263,7 @@ def test_shared_rate_option_changes_only_the_rate_passed_to_ranking(b20):
     sl, sf = rl.summary(), rf.summary()
     assert rl.config.pop('shared_rate_info') == bl.shared_rate_info
     assert rl.config == rf.config
-    assert sl.pop('shared_rate_source') == 'lsdv' and sl.pop('shared_rate_log_range') == 0.0
+    assert sl.pop('shared_rate_source') == 'lsdv' and sl.pop('shared_rate_log_range') is None
     assert sl == sf
 
 
@@ -262,6 +286,9 @@ def test_lsdv_source_returns_valid_ranked_candidates(b60):
     rr = LsdvSource(k=None, rerank=20).candidates(b60)
     assert scan[0][1]['regression_chisq'] <= rr[0][1]['regression_chisq']
     assert any(i['base_rank'] is None for _, i in scan)
+    assert LsdvSource(k=0).candidates(b60) == []
+    with pytest.raises(ValueError):
+        LsdvSource(rerank=0).candidates(b60)
 
 
 def test_lsdv_source_composes_with_the_default_sources(b20):
