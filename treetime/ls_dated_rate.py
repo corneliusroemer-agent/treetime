@@ -23,8 +23,17 @@ collapsed tree; TreeTime's regression on the uncollapsed tree (with LS durations
 solved there) differs slightly, 0.1-0.2% in rate on simulated 80-tip trees.
 The tree passed in is never modified.
 
-Cost is linear in the number of nodes (the postorder half of TreeRegression's
-recursion only), about 1.5 ms at 80 tips and 15 ms at 1000 tips.
+By default (report 107) the polytomies left by the collapse are resolved by
+attachment order (the ladder, or its cross-fitted version on large trees with a
+weak root-to-tip signal) and LSD2's outlier rule, with a clade extension, drops
+outlying tip dates first; ``resolve=None, outlier_z=None``
+(:data:`LSDV_REPORT93`) gives the estimator described above unchanged.
+
+Cost is linear in the number of nodes: the regression runs TreeRegression's
+postorder recursion on flat arrays (:class:`_Regression`), with results equal to
+TreeRegression's to the bit. Report 93's estimator takes about 1 ms at 80 tips;
+the defaults about 0.1 s at 10k tips and a few seconds at 100k (the outlier
+rule dominates).
 """
 import time
 
@@ -172,11 +181,10 @@ def _postorder_Q(treg):
     return treg.tree.root.Q
 
 
-class _Regression:
-    """TreeRegression on a light Bio.Phylo copy of a flat tree, with branch
-    values and variances supplied as arrays per fit. Only the postorder half of
-    TreeRegression's recursion is run (the root's averages are all a slope and
-    intercept need)."""
+class _PhyloRegression:
+    """TreeRegression on a light Bio.Phylo copy of a flat tree (report 93's implementation). Kept as the reference
+    that :class:`_Regression` reproduces bit for bit; Bio.Phylo's recursive traversal makes it O(n x depth), which
+    dominates on deep (ladder-resolved) trees."""
 
     def __init__(self, f):
         self.f = f
@@ -198,6 +206,67 @@ class _Regression:
     def fit(self, val, var, slope=None):
         self.cur['val'], self.cur['var'] = val, var
         return base_regression(_postorder_Q(self.treg), slope=slope)
+
+
+def _sq(a):
+    """Elementwise square as numpy's scalar ``x ** 2`` computes it (C pow), which TreeRegression uses; an array's
+    ``** 2`` is x * x and can differ in the last bit."""
+    return np.fromiter((x ** 2 for x in a), float, len(a))
+
+
+class _Regression:
+    """TreeTime's covariation regression (TreeRegression's postorder averages, then ``base_regression``) on flat
+    arrays. The node updates are TreeRegression.propagate_averages written elementwise over all nodes of one depth
+    at a time, and children are added into their parent in the same order as Bio.Phylo's, so the root averages,
+    and hence slope, intercept, chisq and cov, equal :class:`_PhyloRegression`'s exactly. O(n)."""
+
+    def __init__(self, f):
+        par = np.asarray(f.par)
+        n = len(par)
+        self.par = par
+        self.tip = np.asarray(f.tip, bool)
+        dates = np.asarray(f.date, float)
+        self.tv = np.where(self.tip & np.isfinite(dates), dates, np.nan)
+        depth = np.zeros(n, int)
+        for v in range(1, n):
+            depth[v] = depth[par[v]] + 1
+        order = np.argsort(-depth, kind='stable')  # deepest first; within a depth by index (= Bio.Phylo child order)
+        cuts = np.flatnonzero(np.diff(depth[order])) + 1
+        self.levels = [lv for lv in np.split(order, cuts) if len(lv) and lv[0] != 0]
+
+    def fit(self, val, var, slope=None):
+        val = np.asarray(val, float)
+        var = np.asarray(var, float)
+        n = len(self.par)
+        Q = np.zeros((n, 6))
+        for lv in self.levels:
+            res = np.zeros((len(lv), 6))
+            t = self.tip[lv]
+            if t.any():
+                ti = lv[t]
+                tv, bv, vr = self.tv[ti], val[ti], var[ti]
+                ok = np.isfinite(tv)
+                r = np.zeros((len(ti), 6))
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    r[ok] = np.column_stack([tv[ok] / vr[ok], bv[ok] / vr[ok], _sq(tv[ok]) / vr[ok],
+                                             bv[ok] * tv[ok] / vr[ok], _sq(bv[ok]) / vr[ok], 1.0 / vr[ok]])
+                r[ok & (vr == 0)] = np.inf
+                res[t] = r
+            if (~t).any():
+                ii = lv[~t]
+                q = Q[ii]
+                bv, vr = val[ii], var[ii]
+                ta, da, ts, dt, ds, si = q.T
+                denom = 1.0 / (1 + vr * si)
+                res[~t] = np.column_stack([
+                    ta * denom,
+                    (da + bv * si) * denom,
+                    ts - vr * _sq(ta) * denom,
+                    dt + ta * bv - vr * ta * (da + bv * si) * denom,
+                    ds + 2 * bv * da + _sq(bv) * si - vr * (_sq(da) + 2 * bv * da * si + _sq(bv) * _sq(si)) * denom,
+                    si * denom])
+            np.add.at(Q, self.par[lv], res)  # unbuffered, in index order: children summed as TreeRegression does
+        return base_regression(Q[0], slope=slope)
 
 
 def _ls_durations(f, mu):
@@ -222,10 +291,19 @@ def _ls_durations(f, mu):
     return np.maximum(d, 0.0)
 
 
-LSDV_OPTIONS = dict(resolve=None, resolve_auto_tips=2000, outlier_z=None, outlier_mode='drop', outlier_rounds=5,
+LSDV_OPTIONS = dict(resolve='auto', resolve_auto_tips=1000, resolve_auto_r2=0.2,
+                    outlier_z=3.0, outlier_mode='drop', outlier_rounds=5, outlier_clade_max=4, outlier_clade_z=3.0,
                     internal_b=0.0, first_pass='ls', se_inflation=2.0, resample=0, resample_q=0.2, seed=1)
-"""The opt-in lsdv options (report 103) and their defaults. With every option at its default, lsdv is the estimator
-of report 93 and its rate, intercept and chisq are unchanged."""
+"""The lsdv options and their defaults (report 107): ladder resolution, switching to the cross-fitted ladder when
+there are more than 1000 tips and the plain root-to-tip R^2 (after outlier dates are dropped) is below 0.2; LSD2's
+outlier rule at z = 3, iterated, in drop mode, with the clade extension (an internal branch with |z| > 3 above 2-4
+dated tips drops all their dates); SE inflation 2; one round; no internal b. Every option can be overridden, and
+:data:`LSDV_REPORT93` turns the estimator back into report 93's."""
+
+LSDV_REPORT93 = dict(resolve=None, outlier_z=None)
+"""Options that give report 93's lsdv (no resolution, no outlier rule): its rate, intercept, chisq and, through
+:class:`~treetime.root_candidates.UnrootedBaseline`, its output keys, exactly. Report 103's recommended configuration
+is ``dict(resolve='auto', resolve_auto_tips=2000, resolve_auto_r2=None, outlier_z=3.5, outlier_clade_max=None)``."""
 
 
 def check_lsdv_options(opts):
@@ -249,6 +327,12 @@ def _check(o, opts):
         raise ValueError("lsdv: resolve must be None, 'ladder', 'ladder_xo' or 'auto'")
     if o['outlier_z'] is not None and not o['outlier_z'] > 0:
         raise ValueError('lsdv: outlier_z must be None or > 0')
+    if o['outlier_clade_max'] is not None and not (_isint(o['outlier_clade_max']) and o['outlier_clade_max'] >= 2):
+        raise ValueError('lsdv: outlier_clade_max must be None or an integer >= 2')
+    if o['outlier_clade_z'] is not None and not o['outlier_clade_z'] > 0:
+        raise ValueError('lsdv: outlier_clade_z must be None (= outlier_z) or > 0')
+    if o['resolve_auto_r2'] is not None and not 0 <= o['resolve_auto_r2'] <= 1:
+        raise ValueError('lsdv: resolve_auto_r2 must be None or in [0, 1]')
     if o['outlier_mode'] not in ('drop', 'flag'):
         raise ValueError("lsdv: outlier_mode must be 'drop' or 'flag'")
     if not (_isint(o['outlier_rounds']) and o['outlier_rounds'] >= 1):
@@ -366,18 +450,28 @@ def _robust_rate(par, tip, date, y, rng, m=10):
     return float(np.median(med)) if len(med) else np.nan
 
 
-def lsd2_outliers(f, L, z, rounds=5, seed=0):
+def lsd2_outliers(f, L, z, rounds=5, seed=0, clade_max=None, clade_z=None, clades=None):
     """LSD2's ``-e z`` outlier rule at a fixed root, iterated (report 98, 101): robust median-of-slopes rate, LD node
     times at that rate with V = B + b, branch residuals (B - duration) / sqrt(V) standardised by their mean and SD
     over all branches; dated tips with |z-score| > z lose their date, and the rule is repeated on the remaining dated
     tips until it flags nothing new (at most ``rounds`` passes). A pass that would leave fewer than half of the
-    originally dated tips (or fewer than 3) is not applied; it is recorded with a negative count. Returns (dates with
-    flagged tips set to nan, flagged node indices in flag order, list of (robust rate, number flagged) per pass)."""
+    originally dated tips (or fewer than 3) is not applied; it is recorded with a negative count.
+
+    Clade extension (report 107; ``clade_max`` not None): in each pass, every non-root internal branch with
+    |z-score| > ``clade_z`` (default ``z``) whose subtree holds 2 to ``clade_max`` currently dated tips also flags all
+    of those tips. This catches a date error shared by a small clade, which lands on the branch above it rather than on
+    the terminal branches. The floor applies to the whole pass. ``clades``: optional list that receives the triggering
+    internal node indices.
+
+    Returns (dates with flagged tips set to nan, flagged node indices in flag order, list of (robust rate, number
+    flagged) per pass)."""
     par, tip, date, y = _arrays(f)
     date = date.copy()
     V = y + lsd2_b(f, L)
     flagged, passes = [], []
     n0 = int(np.sum(tip & np.isfinite(date)))
+    zc = z if clade_z is None else clade_z
+    ch = None
     for _ in range(int(rounds)):
         rho = _robust_rate(par, tip, date, y, np.random.default_rng(seed))
         if not rho > 0:
@@ -392,12 +486,34 @@ def lsd2_outliers(f, L, z, rounds=5, seed=0):
             break
         zz = np.r_[0.0, (r - r.mean()) / sd]
         bad = np.flatnonzero((np.abs(zz) > z) & dated)
+        hit = []
+        if clade_max is not None:
+            cnt = dated.astype(int)
+            for v in range(len(par) - 1, 0, -1):
+                cnt[par[v]] += cnt[v]
+            hit = [int(v) for v in np.flatnonzero((np.abs(zz) > zc) & ~tip) if v and 2 <= cnt[v] <= clade_max]
+            if hit:
+                if ch is None:
+                    ch = [[] for _ in par]
+                    for v in range(1, len(par)):
+                        ch[par[v]].append(v)
+                extra = set(bad.tolist())
+                for v in hit:
+                    st = [v]
+                    while st:
+                        u = st.pop()
+                        if dated[u]:
+                            extra.add(u)
+                        st.extend(ch[u])
+                bad = np.array(sorted(extra), int)
         if len(bad) and int(dated.sum()) - len(bad) < max(3, n0 // 2):
             passes.append((rho, -len(bad)))  # floor: a pass that would leave < half the dated tips is not applied
             break
         passes.append((rho, len(bad)))
         if not len(bad):
             break
+        if clades is not None:
+            clades.extend(hit)
         date[bad] = np.nan
         flagged.extend(int(b) for b in bad)
     return date, flagged, passes
@@ -566,9 +682,23 @@ def _resample_interval(R, L, var, out, refit, n, q, seed):
     return res
 
 
+def _report93_like(o):
+    """True when the effective options ``o`` give report 93's estimator (no resolution, outlier rule, internal b,
+    LSD2 first pass or resampling)."""
+    return (o['resolve'] is None and o['outlier_z'] is None and not o['internal_b'] and o['first_pass'] == 'ls'
+            and not o['resample'])
+
+
+def lsdv_reports_extra(options):
+    """Whether an lsdv fit with these options reports its option fields (``resolve``, ``outliers``, ...) and, in
+    :mod:`treetime.root_candidates`, the SE alongside its rate. False only for report 93's estimator
+    (:data:`LSDV_REPORT93`) without ``se_inflation`` passed, so report 93's outputs stay byte-identical."""
+    return not _report93_like(dict(LSDV_OPTIONS, **options)) or 'se_inflation' in options
+
+
 def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
     """:func:`ls_dated_variance_rate` on a flat tree (:func:`_flatten`) with ``L`` alignment sites. Returns the
-    same dict. ``options``: the opt-in variants of :data:`LSDV_OPTIONS` (see :func:`ls_dated_variance_rate`)."""
+    same dict. ``options``: overrides of :data:`LSDV_OPTIONS` (see :func:`ls_dated_variance_rate`)."""
     t0 = time.time()
     if tip_slack < 0:
         raise ValueError('ls_dated_variance_rate: tip_slack must be >= 0')
@@ -578,14 +708,25 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
     info = {}
     g = f
     if o['outlier_z'] is not None:
-        dates, flagged, passes = lsd2_outliers(f, L, o['outlier_z'], rounds=o['outlier_rounds'], seed=0)
+        clades = []
+        dates, flagged, passes = lsd2_outliers(f, L, o['outlier_z'], rounds=o['outlier_rounds'], seed=0,
+                                               clade_max=o['outlier_clade_max'], clade_z=o['outlier_clade_z'],
+                                               clades=clades)
         info.update(outliers=[f.name[i] for i in flagged], outlier_nodes=flagged, outlier_mode=o['outlier_mode'],
-                    outlier_passes=[[float(a), int(b)] for a, b in passes])
+                    outlier_passes=[[float(a), int(b)] for a, b in passes], outlier_clades=len(clades))
         if o['outlier_mode'] == 'drop' and flagged:
             g = _with(f, date=dates)
     method = o['resolve']
     if method == 'auto':
-        method = 'ladder_xo' if int(np.sum(f.tip)) > o['resolve_auto_tips'] else 'ladder'
+        n_tips = int(np.sum(f.tip))
+        big = n_tips > o['resolve_auto_tips']
+        if big and o['resolve_auto_r2'] is not None:
+            try:  # plain root-to-tip R^2 on the dates that remain after the outlier rule
+                info['auto_r2'] = float(_plain_regression(g)[2] ** 2)
+            except ValueError:
+                info['auto_r2'] = float('nan')
+            big = info['auto_r2'] < o['resolve_auto_r2']
+        method = 'ladder_xo' if big else 'ladder'
     out, R, var, r = _fit_resolved(g, L, tip_slack, rate, rounds, o['internal_b'], o['first_pass'], method,
                                    o['seed'])
     out.update(_se_fields(r, out['rate'], out['intercept'], o['se_inflation']))
@@ -595,7 +736,7 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
         out['se_rel'] = float(out['rate_se'] / out['rate'])
         h = 1.96 * o['se_inflation'] * out['rate_se'] / out['rate']
         out['rate_ci'] = [out['rate'] * float(np.exp(-h)), out['rate'] * float(np.exp(h))]
-    if options:
+    if lsdv_reports_extra(options):
         out.update(info, resolve=method, internal_b=float(o['internal_b']), first_pass=o['first_pass'])
         if o['resample'] and out['rate'] > 0:
             ro = dict(o, resample=0, outlier_z=None, resolve=method)
@@ -626,27 +767,44 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
     intercept), root_date_se (delta method), se_inflation and
     rate_ci = rate x exp(+-1.96 se_inflation rate_se / rate).
 
-    Opt-in ``options`` (report 103; defaults in :data:`LSDV_OPTIONS`, with all of
-    them at their defaults the estimator is unchanged):
+    ``options`` (defaults in :data:`LSDV_OPTIONS`, set by report 107; each one
+    can be overridden, and ``**LSDV_REPORT93`` = ``resolve=None,
+    outlier_z=None`` gives report 93's estimator exactly):
 
-    - ``resolve``: None; 'ladder' resolves every polytomy of the collapsed tree
-      by attachment order before the fit (report 101), 'ladder_xo' orders by a
-      Poisson-thinned half of the counts and averages 4 fits on the log scale,
-      'auto' = 'ladder_xo' above ``resolve_auto_tips`` (2000) tips, else 'ladder'.
-    - ``outlier_z``: None (off), or the threshold of LSD2's ``-e`` rule, iterated
-      up to ``outlier_rounds`` (5) passes (report 98/101). ``outlier_mode``
-      'drop' (flagged tips lose their date before the fit) or 'flag' (reported in
-      ``outliers`` only). Reported: ``outliers`` (names), ``outlier_nodes``,
-      ``outlier_passes`` ([robust rate, number flagged] per pass).
+    - ``resolve``: 'auto' (default) = 'ladder', or 'ladder_xo' when there are
+      more than ``resolve_auto_tips`` (1000) tips and the plain root-to-tip R^2,
+      computed after the outlier dates are dropped, is below
+      ``resolve_auto_r2`` (0.2; None = switch on size alone, report 103's
+      rule with ``resolve_auto_tips=2000``). 'ladder' resolves every polytomy
+      of the collapsed tree by attachment order before the fit (report 101);
+      'ladder_xo' orders by a Poisson-thinned half of the counts and averages
+      4 fits on the log scale; None = no resolution. With 'auto' and the size
+      condition met, ``auto_r2`` reports the R^2 used.
+    - ``outlier_z``: threshold of LSD2's ``-e`` rule (3), iterated up to
+      ``outlier_rounds`` (5) passes (report 98/101); None = off. A pass that
+      would leave fewer than half the dated tips is not applied.
+      ``outlier_mode`` 'drop' (default: flagged tips lose their date before
+      the fit) or 'flag' (reported only). ``outlier_clade_max`` (4) and
+      ``outlier_clade_z`` (3; None = ``outlier_z``): the clade extension, an
+      internal branch with |z| > ``outlier_clade_z`` above 2 to
+      ``outlier_clade_max`` dated tips flags all of them (report 107);
+      ``outlier_clade_max=None`` turns it off. Reported: ``outliers`` (names),
+      ``outlier_nodes``, ``outlier_passes`` ([robust rate, number flagged] per
+      pass), ``outlier_clades`` (number of internal branches that triggered).
     - ``internal_b``: LSD2-style constant added to every internal branch's
-      variance, in mutations (b x L in LSD2 units; LSD2's default is 10). 0 = off.
-    - ``first_pass``: 'ls' (lsdv's unweighted LS node times) or 'lsd2' (LSD2's run
-      1: joint WLS with V = B + b) for the first round's durations; with 'lsd2'
-      round 1 uses neither the plain rate nor ``rate``.
-    - ``se_inflation``: factor on the SE in ``rate_ci`` (2, reports 97/101).
+      variance, in mutations (b x L in LSD2 units; LSD2's default is 10). 0 = off
+      (default).
+    - ``first_pass``: 'ls' (default; lsdv's unweighted LS node times) or 'lsd2'
+      (LSD2's run 1: joint WLS with V = B + b) for the first round's durations;
+      with 'lsd2' round 1 uses neither the plain rate nor ``rate``.
+    - ``se_inflation``: factor on the SE in ``rate_ci`` (2, reports 97/101/107).
     - ``resample``: number of LSD2-style resampling replicates (0 = off) for
       ``resample['rate_ci']`` and ``resample['root_date_ci']``; ``resample_q``
       the lognormal SD (0.2); ``seed`` for the resampling and the cross-fit.
+
+    Every fit reports the option fields above plus ``resolve`` (the method
+    used), ``internal_b`` and ``first_pass``, except report 93's estimator
+    without ``se_inflation`` passed (:func:`lsdv_reports_extra`).
     """
     L = int(tt.data.full_length)
     return lsdv_flat(_flatten(tt.tree, 1.0 / L, collapse=collapse), L, tip_slack=tip_slack, rate=rate, rounds=rounds,

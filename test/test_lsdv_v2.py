@@ -1,12 +1,13 @@
 """Opt-in lsdv variants (report 103): ladder resolution of polytomies, the iterated LSD2 outlier rule, an internal
 smoothing constant, the model SE, the resampling interval and LSD2's first pass; their wiring into the shared rate
-and the final report. Each option at its default leaves lsdv unchanged."""
+and the final report. Each option at its default leaves lsdv unchanged. Run against report 93's defaults (the
+``report93_defaults`` fixture of test_lsdv); the report-107 defaults are tested in test_lsdv_defaults."""
 import copy
 
 import numpy as np
 import pytest
 
-from test_lsdv import FIT1, L, baseline, dense_ls_durations, sim, tt_from_tree
+from test_lsdv import FIT1, L, baseline, dense_ls_durations, report93_defaults, sim, tt_from_tree  # noqa: F401
 from treetime import ls_dated_rate as ld
 from treetime.root_candidates import UnrootedBaseline, plain_candidate_sources, rank_root_candidates
 

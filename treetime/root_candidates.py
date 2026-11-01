@@ -134,14 +134,18 @@ class UnrootedBaseline:
         Number of regression placements for ``shared_rate='lsdv'``.
     shared_rate_kwargs : dict, optional
         Options of the lsdv rate (``tip_slack``, default 3; ``rounds``,
-        default 1; ``collapse``, default True), plus the opt-in variants of
+        default 1; ``collapse``, default True), plus overrides of
         :data:`treetime.ls_dated_rate.LSDV_OPTIONS` (``resolve``,
-        ``outlier_z``, ``outlier_mode``, ``internal_b``, ``first_pass``,
-        ``se_inflation``, ``resample``, ...). When any of these is passed,
-        each per-placement row of ``shared_rate_info['candidates']`` also
-        carries the SE (``rate_se``, ``se_rel``, ``rate_ci``) and the variant's
-        report fields (e.g. ``outliers``); a ``resample`` option is dropped for
-        the shared rate, which needs only the rate.
+        ``outlier_z``, ``outlier_clade_max``, ``internal_b``, ``first_pass``,
+        ``se_inflation``, ``resample``, ...). The lsdv defaults (report 107:
+        ladder resolution, outlier rule at z = 3 with the clade extension)
+        apply; ``resolve=None, outlier_z=None``
+        (:data:`treetime.ls_dated_rate.LSDV_REPORT93`) gives report 93's rate.
+        Each per-placement row of ``shared_rate_info['candidates']`` carries
+        the SE (``rate_se``, ``se_rel``, ``rate_ci``) and the option fields
+        (e.g. ``outliers``), except with report 93's options and no
+        ``se_inflation``; a ``resample`` option is dropped for the shared
+        rate, which needs only the rate.
 
     The shared rate also sets the slope of the plain regression source
     (``RegressionSource(slope='fixed')``, in the default Stage 1 shortlist),
@@ -402,9 +406,11 @@ class UnrootedBaseline:
         """lsdv rate at root placement ``cand`` on the baseline branch lengths:
         :func:`treetime.ls_dated_rate.lsdv_flat` on the rooted tree, equal to
         :func:`~treetime.ls_dated_rate.ls_dated_variance_rate` on a TreeTime
-        object rooted there. ``options``: the opt-in lsdv variants
-        (``resolve``, ``outlier_z``, ``internal_b``, ``se_inflation``,
-        ``resample``, ...; :data:`treetime.ls_dated_rate.LSDV_OPTIONS`). Raises
+        object rooted there. ``options``: overrides of the lsdv defaults
+        (``resolve``, ``outlier_z``, ``outlier_clade_max``, ``internal_b``,
+        ``se_inflation``, ``resample``, ...;
+        :data:`treetime.ls_dated_rate.LSDV_OPTIONS`;
+        :data:`~treetime.ls_dated_rate.LSDV_REPORT93` for report 93's). Raises
         ``ValueError`` when the plain root-to-tip rate at ``cand`` (the
         reference rate unless ``rate`` is given) is not positive."""
         from .ls_dated_rate import _flatten, lsdv_flat
@@ -941,7 +947,11 @@ class LsdvSource:
     ``lsdv_rate``, ``lsdv_root_date`` and ``base_rank`` (rank in the covariation
     regression, None for added placements). The chisq values of different roots
     use different variances (durations at each root's own plain rate); whether
-    this ranking places roots better than cov3 is an open benchmark question."""
+    this ranking places roots better than cov3 is an open benchmark question.
+    The fits use report 93's lsdv (``LSDV_REPORT93``: no resolution, no outlier
+    rule), not the lsdv defaults: an outlier rule can drop different dates at
+    different roots, and the ladder changes the tree, so their chisq values
+    would not be comparable."""
 
     name: str = 'lsdv'
     k: Optional[int] = 5
@@ -969,10 +979,11 @@ class LsdvSource:
                 if candidate_key(c) not in seen:
                     seen.add(candidate_key(c))
                     pool.append((c, None))
+        from .ls_dated_rate import LSDV_REPORT93
         scored = []
         for c, base_rank in pool:
-            try:
-                r = baseline.lsdv(c, tip_slack=self.tip_slack, rounds=self.rounds)
+            try:  # report 93's estimator: chisq is compared across roots, so the dated tips and topology stay fixed
+                r = baseline.lsdv(c, tip_slack=self.tip_slack, rounds=self.rounds, **LSDV_REPORT93)
             except (ValueError, FloatingPointError, ZeroDivisionError):
                 continue
             if r['rate'] > 0 and np.isfinite(r['chisq']):
@@ -1718,8 +1729,10 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     ``final_lsdv`` (opt-in, report only; ``True`` or a dict of
     :meth:`UnrootedBaseline.lsdv` options): the lsdv rate and root date at the
     winner's fitted root (``root_candidate``, on the baseline branch lengths),
-    in :attr:`RootSearchResult.final_lsdv` and the summary. Ranking, scores and
-    the headline are unchanged. ``False`` gives exactly the output without it.
+    in :attr:`RootSearchResult.final_lsdv` and the summary. ``True`` uses the
+    lsdv defaults (report 107); ``dict(resolve=None, outlier_z=None)`` gives
+    report 93's lsdv. Ranking, scores and the headline are unchanged.
+    ``False`` gives exactly the output without it.
     """
     fit = fit or FitConfig()
     sources = resolve_candidate_sources(regression_k, candidate_sources, covariation, tip_slack)
@@ -1837,16 +1850,17 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
 
 
 _LSDV_EXTRA = ('rate_se', 'se_rel', 'rate_ci', 'se_inflation', 'root_date_se', 'outliers', 'outlier_mode',
-               'outlier_passes', 'resolve', 'internal_b', 'first_pass', 'n_nodes', 'n_nodes_unresolved', 'xo_rates',
-               'first_pass_rate', 'resample')
-_LSDV_BASE_KEYS = {'tip_slack', 'rounds', 'collapse'}
+               'outlier_passes', 'outlier_clades', 'resolve', 'auto_r2', 'internal_b', 'first_pass', 'n_nodes',
+               'n_nodes_unresolved', 'xo_rates', 'first_pass_rate', 'resample')
 
 
 def _lsdv_extra(x, kwargs):
-    """The SE and opt-in fields of an lsdv result (ls_dated_rate.lsdv_flat) reported alongside its rate. Only when an
-    option beyond report 93's (tip_slack, rounds, collapse) was passed, so report 93's outputs stay byte-identical;
-    pass e.g. ``se_inflation=2`` to get the SE alone."""
-    if not set(kwargs) - _LSDV_BASE_KEYS:
+    """The SE and option fields of an lsdv result (ls_dated_rate.lsdv_flat) reported alongside its rate: always,
+    except for report 93's estimator (``resolve=None, outlier_z=None``) without ``se_inflation``, so report 93's
+    outputs stay byte-identical (:func:`treetime.ls_dated_rate.lsdv_reports_extra`)."""
+    from .ls_dated_rate import lsdv_reports_extra
+    opts = {k: v for k, v in kwargs.items() if k not in ('tip_slack', 'rounds', 'collapse')}
+    if not lsdv_reports_extra(opts):
         return {}
     return {k: x[k] for k in _LSDV_EXTRA if k in x}
 

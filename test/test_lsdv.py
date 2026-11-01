@@ -2,7 +2,13 @@
 from least-squares-dated durations, and its opt-in uses in root search: the
 shared rate (UnrootedBaseline(shared_rate='lsdv')), a candidate source
 (LsdvSource) and the final rate report (rank_root_candidates(final_lsdv=)).
-The defaults are checked to be unchanged."""
+The defaults are checked to be unchanged.
+
+These tests describe report 93's estimator. Since report 107 the lsdv defaults
+add ladder resolution and the outlier rule, so this module (and test_lsdv_v2,
+which imports the fixture) runs with ``LSDV_OPTIONS`` set to report 93's values
+(``LSDV_REPORT93``); test_lsdv_defaults checks that passing ``LSDV_REPORT93``
+explicitly gives the same results through every entry point."""
 import copy
 
 import numpy as np
@@ -18,6 +24,13 @@ from treetime.root_candidates import (EdgeRoot, FitConfig, LsdvSource, NodeRoot,
 
 L = 1000
 FIT1 = FitConfig(iterations=1)
+REPORT93_DEFAULTS = dict(ld.LSDV_OPTIONS, **ld.LSDV_REPORT93)
+
+
+@pytest.fixture(autouse=True)
+def report93_defaults(monkeypatch):
+    """lsdv defaults of report 93 (no resolution, no outlier rule) for the tests of this module."""
+    monkeypatch.setattr(ld, 'LSDV_OPTIONS', REPORT93_DEFAULTS)
 
 
 def rows(res):
