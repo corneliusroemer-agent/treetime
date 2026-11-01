@@ -402,6 +402,10 @@ class UnrootedBaseline:
         d = float(np.mean(d))
         return d if np.isfinite(d) else np.nan
 
+    def _tip_date_var(self, leaf):
+        from .ls_dated_rate import _range_var
+        return _range_var(self.dates.get(leaf.name))
+
     def lsdv(self, cand, tip_slack=3.0, rounds=1, collapse=True, rate=None, **options):
         """lsdv rate at root placement ``cand`` on the baseline branch lengths:
         :func:`treetime.ls_dated_rate.lsdv_flat` on the rooted tree, equal to
@@ -416,7 +420,7 @@ class UnrootedBaseline:
         from .ls_dated_rate import _flatten, lsdv_flat
         L = self.full_length
         f = _flatten(self.rooted_phylo(self.canonical(cand)), 1.0 / L, collapse=collapse,
-                     length=lambda n: n.branch_length, date=self._tip_date)
+                     length=lambda n: n.branch_length, date=self._tip_date, date_var=self._tip_date_var)
         return lsdv_flat(f, L, tip_slack=tip_slack, rate=rate, rounds=rounds, **options)
 
     def _lsdv_shared_rate(self, regression_rate, k, kwargs):

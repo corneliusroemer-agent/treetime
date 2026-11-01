@@ -47,18 +47,20 @@ COLLAPSE_MUTATIONS = 0.1  # internal edges shorter than this (in mutations) and 
 
 class _Flat:
     """Rooted tree as parallel lists, parents before children after
-    :meth:`preorder` (root = 0). Per node: par, tip, date (nan if none), ml
-    (branch value, mutation_length), name."""
+    :meth:`preorder` (root = 0). Per node: par, tip, date (nan if none; the
+    midpoint of a date range), ml (branch value, mutation_length), name, dvar
+    (variance of a range date, width^2 / 12; 0 for an exact date)."""
 
     def __init__(self):
-        self.par, self.tip, self.date, self.ml, self.name = [], [], [], [], []
+        self.par, self.tip, self.date, self.ml, self.name, self.dvar = [], [], [], [], [], []
 
-    def add(self, par, tip, date, ml, name=None):
+    def add(self, par, tip, date, ml, name=None, dvar=0.0):
         self.par.append(par)
         self.tip.append(tip)
         self.date.append(date)
         self.ml.append(ml)
         self.name.append(name)
+        self.dvar.append(dvar)
         return len(self.par) - 1
 
     def children(self):
@@ -79,7 +81,8 @@ class _Flat:
         new = {v: i for i, v in enumerate(order)}
         out = _Flat()
         for v in order:
-            out.add(new[self.par[v]] if self.par[v] >= 0 else -1, self.tip[v], self.date[v], self.ml[v], self.name[v])
+            out.add(new[self.par[v]] if self.par[v] >= 0 else -1, self.tip[v], self.date[v], self.ml[v], self.name[v],
+                    self.dvar[v])
         return out
 
 
@@ -94,14 +97,31 @@ def _tip_date(n):
     return d if np.isfinite(d) else np.nan
 
 
-def _flatten(tree, om, collapse=True, length=None, date=None):
+def _range_var(d):
+    """Variance width^2 / 12 of a date given as a range [lo, hi] (uniform on it); 0 for a single date."""
+    if d is None or np.ndim(d) == 0 or len(d) != 2:
+        return 0.0
+    lo, hi = float(d[0]), float(d[1])
+    return (hi - lo) ** 2 / 12.0 if np.isfinite(lo) and np.isfinite(hi) else 0.0
+
+
+def _tip_date_var(n):
+    """Variance of a tip's date range (``raw_date_constraint`` [lo, hi]); 0 for an exact date."""
+    if not n.is_terminal() or getattr(n, 'bad_branch', False):
+        return 0.0
+    return _range_var(getattr(n, 'raw_date_constraint', None))
+
+
+def _flatten(tree, om, collapse=True, length=None, date=None, date_var=None):
     """Flat copy of a rooted Bio.Phylo tree. Branch values are ``length(node)``
     (default ``mutation_length``), tip dates ``date(node)`` (default
-    :func:`_tip_date`). With ``collapse``, internal edges of length below
+    :func:`_tip_date`), date-range variances ``date_var(node)`` (default
+    :func:`_tip_date_var`). With ``collapse``, internal edges of length below
     COLLAPSE_MUTATIONS mutations (``om`` = one mutation) are collapsed: their
     length is pushed onto the children, so every root-to-tip sum is kept."""
     length = length or (lambda n: n.mutation_length)
     date = date or _tip_date
+    date_var = date_var or _tip_date_var
     f = _Flat()
     stack = [(tree.root, -1, 0.0)]
     while stack:
@@ -111,7 +131,8 @@ def _flatten(tree, om, collapse=True, length=None, date=None):
             for c in reversed(n.clades):  # children attach to p, inheriting this edge
                 stack.append((c, p, ml))
             continue
-        i = f.add(p, n.is_terminal(), date(n) if n.is_terminal() else np.nan, ml, n.name)
+        i = f.add(p, n.is_terminal(), date(n) if n.is_terminal() else np.nan, ml, n.name,
+                  float(date_var(n)) if n.is_terminal() else 0.0)
         for c in reversed(n.clades):
             stack.append((c, i, 0.0))
     return f.preorder()
@@ -293,11 +314,13 @@ def _ls_durations(f, mu):
 
 LSDV_OPTIONS = dict(resolve='auto', resolve_auto_tips=1000, resolve_auto_r2=0.2,
                     outlier_z=4.5, outlier_mode='drop', outlier_rounds=5, outlier_clade_max=4, outlier_clade_z=4.5,
-                    internal_b=0.0, first_pass='ls', se_inflation=2.0, resample=0, resample_q=0.2, seed=1)
+                    internal_b=0.0, first_pass='ls', se_inflation=2.0, resample=0, resample_q=0.2, seed=1,
+                    date_ranges='variance')
 """The lsdv options and their defaults (reports 107 and 111): ladder resolution, switching to the cross-fitted ladder
 when there are more than 1000 tips and the plain root-to-tip R^2 (after outlier dates are dropped) is below 0.2; LSD2's
 outlier rule at z = 4.5, iterated, in drop mode, with the clade extension (an internal branch with |z| > 4.5 above 2-4
-dated tips drops all their dates); SE inflation 2; one round; no internal b. z = 4.5 keeps the share of correctly
+dated tips drops all their dates); SE inflation 2; one round; no internal b; range dates (month or year only) carry
+their uncertainty (``date_ranges='variance'``). z = 4.5 keeps the share of correctly
 dated tips that are flagged at or below about 0.2% from 100 to 10,000 tips (z = 3 flags 1.5-3%) and still catches
 gross date errors. Every option can be overridden: :data:`LSDV_REPORT108` restores report 108's z = 3, and
 :data:`LSDV_REPORT93` turns the estimator back into report 93's."""
@@ -348,6 +371,8 @@ def _check(o, opts):
         raise ValueError('lsdv: seed must be an integer')
     if not o['internal_b'] >= 0:
         raise ValueError('lsdv: internal_b must be >= 0')
+    if o['date_ranges'] not in ('variance', 'midpoint'):
+        raise ValueError("lsdv: date_ranges must be 'variance' or 'midpoint'")
     if o['first_pass'] not in ('ls', 'lsd2'):
         raise ValueError("lsdv: first_pass must be 'ls' or 'lsd2'")
     if not o['se_inflation'] > 0:
@@ -363,22 +388,29 @@ def _arrays(f):
     return (np.asarray(f.par), np.asarray(f.tip, bool), np.asarray(f.date, float), np.asarray(f.ml, float))
 
 
-def _from_arrays(par, tip, date, ml, name):
+def _dvar(f):
+    """Date-range variances of a flat tree (0 for exact dates and internal nodes)."""
+    return np.asarray(getattr(f, 'dvar', None) or np.zeros(len(f.par)), float)
+
+
+def _from_arrays(par, tip, date, ml, name, dvar=None):
     out = _Flat()
     for i in range(len(par)):
-        out.add(int(par[i]), bool(tip[i]), float(date[i]) if tip[i] else np.nan, float(ml[i]), name[i])
+        out.add(int(par[i]), bool(tip[i]), float(date[i]) if tip[i] else np.nan, float(ml[i]), name[i],
+                float(dvar[i]) if dvar is not None and tip[i] else 0.0)
     return out
 
 
 def _with(f, date=None, ml=None):
     """Copy of flat tree ``f`` with new tip dates and/or branch values (same topology and numbering)."""
     par, tip, d0, m0 = _arrays(f)
-    return _from_arrays(par, tip, d0 if date is None else date, m0 if ml is None else ml, f.name)
+    return _from_arrays(par, tip, d0 if date is None else date, m0 if ml is None else ml, f.name, _dvar(f))
 
 
 def _collapse_flat(f, thr):
     """Collapse internal non-root edges with value < thr (value pushed onto the children), as :func:`_flatten`."""
     par, tip, date, ml = _arrays(f)
+    dv = _dvar(f)
     ch = [[] for _ in par]
     for v in range(1, len(par)):
         ch[par[v]].append(v)
@@ -391,7 +423,7 @@ def _collapse_flat(f, thr):
             for c in reversed(ch[v]):
                 stack.append((c, p, y))
             continue
-        i = out.add(p, bool(tip[v]), float(date[v]) if tip[v] else np.nan, y, f.name[v])
+        i = out.add(p, bool(tip[v]), float(date[v]) if tip[v] else np.nan, y, f.name[v], float(dv[v]))
         for c in reversed(ch[v]):
             stack.append((c, i, 0.0))
     return out.preorder()
@@ -455,7 +487,7 @@ def _robust_rate(par, tip, date, y, rng, m=10):
     return float(np.median(med)) if len(med) else np.nan
 
 
-def lsd2_outliers(f, L, z, rounds=5, seed=0, clade_max=None, clade_z=None, clades=None):
+def lsd2_outliers(f, L, z, rounds=5, seed=0, clade_max=None, clade_z=None, clades=None, date_ranges=False):
     """LSD2's ``-e z`` outlier rule at a fixed root, iterated (report 98, 101): robust median-of-slopes rate, LD node
     times at that rate with V = B + b, branch residuals (B - duration) / sqrt(V) standardised by their mean and SD
     over all branches; dated tips with |z-score| > z lose their date, and the rule is repeated on the remaining dated
@@ -468,11 +500,16 @@ def lsd2_outliers(f, L, z, rounds=5, seed=0, clade_max=None, clade_z=None, clade
     the terminal branches. The floor applies to the whole pass. ``clades``: optional list that receives the triggering
     internal node indices.
 
+    ``date_ranges``: a tip whose date is a range (``dvar`` > 0) is judged against the range rather than its midpoint:
+    its terminal residual is the distance from the tip position its branch implies to the nearest end of the range (0
+    inside it), so a month-only or year-only date is flagged only when it is wrong by more than the range.
+
     Returns (dates with flagged tips set to nan, flagged node indices in flag order, list of (robust rate, number
     flagged) per pass)."""
     par, tip, date, y = _arrays(f)
     date = date.copy()
     V = y + lsd2_b(f, L)
+    half = np.sqrt(3.0 * _dvar(f)) if date_ranges else np.zeros(len(par))  # half-width of each range
     flagged, passes = [], []
     n0 = int(np.sum(tip & np.isfinite(date)))
     zc = z if clade_z is None else clade_z
@@ -484,7 +521,12 @@ def lsd2_outliers(f, L, z, rounds=5, seed=0, clade_max=None, clade_z=None, clade
             break
         dated = tip & np.isfinite(date)
         x = _node_positions(par, tip, np.where(dated, rho * date, np.nan), y, np.minimum(1.0 / V, 1e9))
-        r = (y - np.r_[0.0, x[1:] - x[par[1:]]])[1:] / np.sqrt(V[1:])
+        xt = x
+        rt = np.flatnonzero(dated & (half > 0))
+        if len(rt):  # range tips: the tip position in rho x [lo, hi] nearest the one its branch implies
+            xt = x.copy()
+            xt[rt] = np.clip(x[par[rt]] + y[rt], rho * (date[rt] - half[rt]), rho * (date[rt] + half[rt]))
+        r = (y - np.r_[0.0, xt[1:] - x[par[1:]]])[1:] / np.sqrt(V[1:])
         sd = r.std(ddof=1)
         if not sd > 0:
             passes.append((rho, 0))
@@ -537,6 +579,7 @@ def ladder_resolve(f, mu, y_order=None):
     ch = [[] for _ in par]
     for v in range(1, len(par)):
         ch[par[v]].append(v)
+    dvar = list(_dvar(f))
     par, tip, date, y, name = list(par), list(tip), list(date), list(y), list(f.name)
     for v in range(len(ch)):
         k = len(ch[v])
@@ -548,16 +591,19 @@ def ladder_resolve(f, mu, y_order=None):
             if j < k - 1:
                 h = len(par)
                 par.append(cur); tip.append(False); date.append(np.nan); y.append(0.0); name.append(None)
+                dvar.append(0.0)
                 par[c] = h
                 cur = h
             else:
                 par[c] = cur
-    return _from_arrays(par, tip, date, y, name).preorder()
+    return _from_arrays(par, tip, date, y, name, dvar).preorder()
 
 
-def _lsdv_core(f, L, tip_slack, rate, rounds, internal_b=0.0, first_pass='ls'):
+def _lsdv_core(f, L, tip_slack, rate, rounds, internal_b=0.0, first_pass='ls', date_ranges=False):
     """lsdv's fit on flat tree ``f`` (report 93), plus the opt-in internal smoothing constant and first pass.
-    Returns (result dict, final variances, fitted regression dict)."""
+    ``date_ranges``: a range date's variance (width^2 / 12, ``dvar``) is added to its tip's variance, in distance
+    units (times the round's reference rate squared). Returns (result dict, final variances, fitted regression
+    dict)."""
     om = 1.0 / L
     plain_rate, plain_icpt, r_val = _plain_regression(f)
     mu = plain_rate if rate is None else float(rate)
@@ -569,14 +615,21 @@ def _lsdv_core(f, L, tip_slack, rate, rounds, internal_b=0.0, first_pass='ls'):
     extra = np.where(tip, float(tip_slack) ** 2 * om, 0.0)
     if internal_b:
         extra = extra + np.where(tip, 0.0, float(internal_b) * om)
+    dv = _dvar(f) if date_ranges else None
+    if dv is not None and not np.any(dv > 0):
+        dv = None
     round_rates = []
     first_rate = None
     for i in range(max(1, int(rounds))):
         if i == 0 and first_pass == 'lsd2':
             dur, first_rate = _lsd2_first_pass(f, L)
+            mu_dur = first_rate
         else:
             dur = _ls_durations(f, mu)
+            mu_dur = mu
         var = (dur + extra) * om
+        if dv is not None:  # date uncertainty of range tips, in root-to-tip distance units
+            var = var + np.where(tip, mu_dur * mu_dur * dv, 0.0)
         var[0] = om * om
         r = reg.fit(ml, var)
         slope, icpt = float(r['slope']), float(r['intercept'])
@@ -607,10 +660,10 @@ def _se_fields(r, rate, icpt, k):
     return out
 
 
-def _fit_resolved(f, L, tip_slack, rate, rounds, internal_b, first_pass, method, seed, xo_reps=2):
+def _fit_resolved(f, L, tip_slack, rate, rounds, internal_b, first_pass, method, seed, xo_reps=2, date_ranges=False):
     """Resolution (None / 'ladder' / 'ladder_xo') + core fit. Returns (result, fitted flat tree, variances, reg)."""
     if method is None:
-        out, var, r = _lsdv_core(f, L, tip_slack, rate, rounds, internal_b, first_pass)
+        out, var, r = _lsdv_core(f, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges)
         return out, f, var, r
     plain_rate = _plain_regression(f)[0]
     mu0 = plain_rate if rate is None else float(rate)
@@ -618,7 +671,7 @@ def _fit_resolved(f, L, tip_slack, rate, rounds, internal_b, first_pass, method,
         raise ValueError('ls_dated_variance_rate: reference rate not positive')
     if method == 'ladder':
         R = ladder_resolve(f, mu0)
-        out, var, r = _lsdv_core(R, L, tip_slack, rate, rounds, internal_b, first_pass)
+        out, var, r = _lsdv_core(R, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges)
         out.update(n_nodes_unresolved=len(f.par))
         return out, R, var, r
     # ladder_xo: order by a Poisson-thinned half, fit on all counts, both halves, xo_reps draws; geometric mean
@@ -633,7 +686,7 @@ def _fit_resolved(f, L, tip_slack, rate, rounds, internal_b, first_pass, method,
             if not mu > 0:
                 continue
             R = ladder_resolve(f, mu, y_order=h)
-            o, var, r = _lsdv_core(R, L, tip_slack, rate, rounds, internal_b, first_pass)
+            o, var, r = _lsdv_core(R, L, tip_slack, rate, rounds, internal_b, first_pass, date_ranges)
             if o['rate'] > 0:
                 fits.append((o, R, var, r))
     if not fits:
@@ -710,13 +763,14 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
     if 'collapse' in options or 'rate' in options:
         raise ValueError('lsdv_flat: collapse and rate are not options here (collapse when flattening)')
     o = check_lsdv_options(options) if options else LSDV_OPTIONS
+    ranges = o['date_ranges'] == 'variance'
     info = {}
     g = f
     if o['outlier_z'] is not None:
         clades = []
         dates, flagged, passes = lsd2_outliers(f, L, o['outlier_z'], rounds=o['outlier_rounds'], seed=0,
                                                clade_max=o['outlier_clade_max'], clade_z=o['outlier_clade_z'],
-                                               clades=clades)
+                                               clades=clades, date_ranges=ranges)
         info.update(outliers=[f.name[i] for i in flagged], outlier_nodes=flagged, outlier_mode=o['outlier_mode'],
                     outlier_passes=[[float(a), int(b)] for a, b in passes])
         if o['outlier_clade_max'] is not None:
@@ -735,7 +789,7 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
             big = info['auto_r2'] < o['resolve_auto_r2']
         method = 'ladder_xo' if big else 'ladder'
     out, R, var, r = _fit_resolved(g, L, tip_slack, rate, rounds, o['internal_b'], o['first_pass'], method,
-                                   o['seed'])
+                                   o['seed'], date_ranges=ranges)
     out.update(_se_fields(r, out['rate'], out['intercept'], o['se_inflation']))
     if 'xo_rates' in out and r['slope'] > 0 and np.isfinite(out['rate_se']):
         # cross-fit: keep the member fit's relative SE around the geometric-mean rate
@@ -810,6 +864,14 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
       ladder still needs a positive reference rate, so without one pass
       ``resolve=None`` as well.
     - ``se_inflation``: factor on the SE in ``rate_ci`` (2, reports 97/101/107).
+    - ``date_ranges``: how a tip date given as a range [lo, hi] (a month-only
+      or year-only date, TreeTime's ``raw_date_constraint``) enters.
+      'variance' (default): the regression uses the midpoint and adds the
+      range's variance, width^2 / 12 times the reference rate squared, to that
+      tip's variance, so the tip weighs less; the outlier rule judges the tip
+      by its distance to the nearest end of the range, so a correct partial
+      date is not flagged. 'midpoint': the midpoint as an exact date
+      (before report 116).
     - ``resample``: number of LSD2-style resampling replicates (0 = off) for
       ``resample['rate_ci']`` and ``resample['root_date_ci']``; ``resample_q``
       the lognormal SD (0.2); ``seed`` for the resampling and the cross-fit.
