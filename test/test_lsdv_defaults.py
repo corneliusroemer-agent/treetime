@@ -1,4 +1,5 @@
-"""lsdv defaults of report 107: ladder resolution (cross-fitted ladder on large trees with a weak root-to-tip signal),
+"""lsdv defaults of report 108 (run here with LSDV_OPTIONS set to them; the current defaults differ only in the
+outlier thresholds, z = 4.5, see test_lsdv_gold_v2): ladder resolution (cross-fitted ladder on large trees with a weak root-to-tip signal),
 LSD2's outlier rule at z = 3 with the clade extension, SE inflation 2, one round, no internal b. Each feature can be
 turned off, report 93's estimator is reachable with LSDV_REPORT93, and the pre-108 package's outputs are reproduced
 (reference values from 4818c34ba, investigation report 108, 04-tests/old_refs.py)."""
@@ -10,6 +11,14 @@ from treetime import ls_dated_rate as ld
 from treetime.root_candidates import LsdvSource, plain_candidate_sources, rank_root_candidates, regression_candidates
 
 R93 = ld.LSDV_REPORT93
+# report 108's defaults (z = 3): this module tests them; the current defaults (z = 4.5) are in test_lsdv_gold_v2
+REPORT108_DEFAULTS = dict(ld.LSDV_OPTIONS, **ld.LSDV_REPORT108)
+
+
+@pytest.fixture(autouse=True)
+def report108_defaults(monkeypatch):
+    monkeypatch.setattr(ld, 'LSDV_OPTIONS', REPORT108_DEFAULTS)
+
 REC103 = dict(resolve='auto', resolve_auto_tips=2000, resolve_auto_r2=None, outlier_z=3.5, outlier_clade_max=None)
 # old option dict -> the same estimator under the report-107 defaults
 OLD_TO_NEW = {'r93': R93, 'rec103': REC103,

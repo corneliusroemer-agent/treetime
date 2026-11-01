@@ -137,8 +137,8 @@ class UnrootedBaseline:
         default 1; ``collapse``, default True), plus overrides of
         :data:`treetime.ls_dated_rate.LSDV_OPTIONS` (``resolve``,
         ``outlier_z``, ``outlier_clade_max``, ``internal_b``, ``first_pass``,
-        ``se_inflation``, ``resample``, ...). The lsdv defaults (report 107:
-        ladder resolution, outlier rule at z = 3 with the clade extension)
+        ``se_inflation``, ``resample``, ...). The lsdv defaults (reports 107 and
+        111: ladder resolution, outlier rule at z = 4.5 with the clade extension)
         apply; ``resolve=None, outlier_z=None``
         (:data:`treetime.ls_dated_rate.LSDV_REPORT93`) gives report 93's rate.
         Each per-placement row of ``shared_rate_info['candidates']`` carries

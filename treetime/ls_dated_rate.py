@@ -25,8 +25,8 @@ The tree passed in is never modified.
 
 By default (report 107) the polytomies left by the collapse are resolved by
 attachment order (the ladder, or its cross-fitted version on large trees with a
-weak root-to-tip signal) and LSD2's outlier rule, with a clade extension, drops
-outlying tip dates first; ``resolve=None, outlier_z=None``
+weak root-to-tip signal) and LSD2's outlier rule (z = 4.5), with a clade extension,
+drops outlying tip dates first; ``resolve=None, outlier_z=None``
 (:data:`LSDV_REPORT93`) gives the estimator described above unchanged.
 
 Cost is linear in the number of nodes: the regression runs TreeRegression's
@@ -292,13 +292,18 @@ def _ls_durations(f, mu):
 
 
 LSDV_OPTIONS = dict(resolve='auto', resolve_auto_tips=1000, resolve_auto_r2=0.2,
-                    outlier_z=3.0, outlier_mode='drop', outlier_rounds=5, outlier_clade_max=4, outlier_clade_z=3.0,
+                    outlier_z=4.5, outlier_mode='drop', outlier_rounds=5, outlier_clade_max=4, outlier_clade_z=4.5,
                     internal_b=0.0, first_pass='ls', se_inflation=2.0, resample=0, resample_q=0.2, seed=1)
-"""The lsdv options and their defaults (report 107): ladder resolution, switching to the cross-fitted ladder when
-there are more than 1000 tips and the plain root-to-tip R^2 (after outlier dates are dropped) is below 0.2; LSD2's
-outlier rule at z = 3, iterated, in drop mode, with the clade extension (an internal branch with |z| > 3 above 2-4
-dated tips drops all their dates); SE inflation 2; one round; no internal b. Every option can be overridden, and
+"""The lsdv options and their defaults (reports 107 and 111): ladder resolution, switching to the cross-fitted ladder
+when there are more than 1000 tips and the plain root-to-tip R^2 (after outlier dates are dropped) is below 0.2; LSD2's
+outlier rule at z = 4.5, iterated, in drop mode, with the clade extension (an internal branch with |z| > 4.5 above 2-4
+dated tips drops all their dates); SE inflation 2; one round; no internal b. z = 4.5 keeps the share of correctly
+dated tips that are flagged at or below about 0.2% from 100 to 10,000 tips (z = 3 flags 1.5-3%) and still catches
+gross date errors. Every option can be overridden: :data:`LSDV_REPORT108` restores report 108's z = 3, and
 :data:`LSDV_REPORT93` turns the estimator back into report 93's."""
+
+LSDV_REPORT108 = dict(outlier_z=3.0, outlier_clade_z=3.0)
+"""Options that give report 108's defaults (outlier rule and clade extension at z = 3) on top of the current ones."""
 
 LSDV_REPORT93 = dict(resolve=None, outlier_z=None)
 """Options that give report 93's lsdv (no resolution, no outlier rule): its rate, intercept, chisq and, through
@@ -769,7 +774,7 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
     intercept), root_date_se (delta method), se_inflation and
     rate_ci = rate x exp(+-1.96 se_inflation rate_se / rate).
 
-    ``options`` (defaults in :data:`LSDV_OPTIONS`, set by report 107; each one
+    ``options`` (defaults in :data:`LSDV_OPTIONS`, set by reports 107 and 111; each one
     can be overridden, and ``**LSDV_REPORT93`` = ``resolve=None,
     outlier_z=None`` gives report 93's estimator exactly):
 
@@ -783,12 +788,12 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
       'ladder_xo' orders by a Poisson-thinned half of the counts and averages
       4 fits on the log scale; None = no resolution. With 'auto' and the size
       condition met, ``auto_r2`` reports the R^2 used.
-    - ``outlier_z``: threshold of LSD2's ``-e`` rule (3), iterated up to
+    - ``outlier_z``: threshold of LSD2's ``-e`` rule (4.5), iterated up to
       ``outlier_rounds`` (5) passes (report 98/101); None = off. A pass that
       would leave fewer than half the dated tips is not applied.
       ``outlier_mode`` 'drop' (default: flagged tips lose their date before
       the fit) or 'flag' (reported only). ``outlier_clade_max`` (4) and
-      ``outlier_clade_z`` (3; None = ``outlier_z``): the clade extension, an
+      ``outlier_clade_z`` (4.5; None = ``outlier_z``): the clade extension, an
       internal branch with |z| > ``outlier_clade_z`` above 2 to
       ``outlier_clade_max`` dated tips flags all of them (report 107);
       ``outlier_clade_max=None`` turns it off (``outlier_clade_z`` is then
