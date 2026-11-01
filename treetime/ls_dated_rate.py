@@ -234,23 +234,37 @@ def check_lsdv_options(opts):
     bad = set(opts) - set(LSDV_OPTIONS) - {'tip_slack', 'rate', 'rounds', 'collapse'}
     if bad:
         raise ValueError('lsdv: unknown options %s' % sorted(bad))
-    o = dict(LSDV_OPTIONS, **opts)
+    try:
+        return _check(dict(LSDV_OPTIONS, **opts), opts)
+    except TypeError as e:
+        raise ValueError('lsdv: invalid option type (%s)' % e)
+
+
+def _isint(x):
+    return isinstance(x, (int, np.integer)) and not isinstance(x, bool)
+
+
+def _check(o, opts):
     if o['resolve'] not in (None, 'ladder', 'ladder_xo', 'auto'):
         raise ValueError("lsdv: resolve must be None, 'ladder', 'ladder_xo' or 'auto'")
     if o['outlier_z'] is not None and not o['outlier_z'] > 0:
         raise ValueError('lsdv: outlier_z must be None or > 0')
     if o['outlier_mode'] not in ('drop', 'flag'):
         raise ValueError("lsdv: outlier_mode must be 'drop' or 'flag'")
-    if not (int(o['outlier_rounds']) >= 1):
-        raise ValueError('lsdv: outlier_rounds must be >= 1')
+    if not (_isint(o['outlier_rounds']) and o['outlier_rounds'] >= 1):
+        raise ValueError('lsdv: outlier_rounds must be an integer >= 1')
+    if not (_isint(o['resolve_auto_tips']) and o['resolve_auto_tips'] >= 0):
+        raise ValueError('lsdv: resolve_auto_tips must be an integer >= 0')
+    if not _isint(o['seed']):
+        raise ValueError('lsdv: seed must be an integer')
     if not o['internal_b'] >= 0:
         raise ValueError('lsdv: internal_b must be >= 0')
     if o['first_pass'] not in ('ls', 'lsd2'):
         raise ValueError("lsdv: first_pass must be 'ls' or 'lsd2'")
     if not o['se_inflation'] > 0:
         raise ValueError('lsdv: se_inflation must be > 0')
-    if not (int(o['resample']) >= 0 and o['resample_q'] >= 0):
-        raise ValueError('lsdv: resample must be >= 0 and resample_q >= 0')
+    if not (_isint(o['resample']) and o['resample'] >= 0 and o['resample_q'] >= 0):
+        raise ValueError('lsdv: resample must be an integer >= 0 and resample_q >= 0')
     if opts.get('tip_slack', 3.0) < 0 or opts.get('rounds', 1) < 1:
         raise ValueError('lsdv: tip_slack must be >= 0 and rounds >= 1')
     return o
@@ -356,12 +370,14 @@ def lsd2_outliers(f, L, z, rounds=5, seed=0):
     """LSD2's ``-e z`` outlier rule at a fixed root, iterated (report 98, 101): robust median-of-slopes rate, LD node
     times at that rate with V = B + b, branch residuals (B - duration) / sqrt(V) standardised by their mean and SD
     over all branches; dated tips with |z-score| > z lose their date, and the rule is repeated on the remaining dated
-    tips until it flags nothing new (at most ``rounds`` passes). Returns (dates with flagged tips set to nan,
-    flagged node indices in flag order, list of (robust rate, number flagged) per pass)."""
+    tips until it flags nothing new (at most ``rounds`` passes). A pass that would leave fewer than half of the
+    originally dated tips (or fewer than 3) is not applied; it is recorded with a negative count. Returns (dates with
+    flagged tips set to nan, flagged node indices in flag order, list of (robust rate, number flagged) per pass)."""
     par, tip, date, y = _arrays(f)
     date = date.copy()
     V = y + lsd2_b(f, L)
     flagged, passes = [], []
+    n0 = int(np.sum(tip & np.isfinite(date)))
     for _ in range(int(rounds)):
         rho = _robust_rate(par, tip, date, y, np.random.default_rng(seed))
         if not rho > 0:
@@ -376,6 +392,9 @@ def lsd2_outliers(f, L, z, rounds=5, seed=0):
             break
         zz = np.r_[0.0, (r - r.mean()) / sd]
         bad = np.flatnonzero((np.abs(zz) > z) & dated)
+        if len(bad) and int(dated.sum()) - len(bad) < max(3, n0 // 2):
+            passes.append((rho, -len(bad)))  # floor: a pass that would leave < half the dated tips is not applied
+            break
         passes.append((rho, len(bad)))
         if not len(bad):
             break
@@ -421,7 +440,7 @@ def _lsdv_core(f, L, tip_slack, rate, rounds, internal_b=0.0, first_pass='ls'):
     om = 1.0 / L
     plain_rate, plain_icpt, r_val = _plain_regression(f)
     mu = plain_rate if rate is None else float(rate)
-    if not (mu > 0 and np.isfinite(mu)):
+    if not (mu > 0 and np.isfinite(mu)) and not (first_pass == 'lsd2' and int(rounds) <= 1):
         raise ValueError('ls_dated_variance_rate: reference rate not positive')
     tip = np.asarray(f.tip)
     ml = np.asarray(f.ml, float)
@@ -457,7 +476,8 @@ def _se_fields(r, rate, icpt, k):
     delta method, and the log-symmetric interval rate x exp(+-1.96 k SE / rate)."""
     cov = np.asarray(r['cov'], float)
     se = float(np.sqrt(cov[0, 0])) if cov[0, 0] > 0 else np.nan
-    out = dict(rate_se=se, cov=cov.tolist(), se_inflation=float(k), rate_ci=None, root_date_se=None)
+    out = dict(rate_se=se, se_rel=float(se / rate) if rate > 0 else None, cov=cov.tolist(), se_inflation=float(k),
+               rate_ci=None, root_date_se=None)
     if rate > 0 and np.isfinite(se):
         h = 1.96 * k * se / rate
         out['rate_ci'] = [float(rate * np.exp(-h)), float(rate * np.exp(h))]
@@ -512,13 +532,16 @@ def _fit_resolved(f, L, tip_slack, rate, rounds, internal_b, first_pass, method,
 
 
 def _resample_interval(R, L, var, out, refit, n, q, seed):
-    """LSD2-style resampling interval (report 98): counts ~ Poisson(L x fitted duration) x lognormal(mean 1, sd q)
-    on the fitted (resolved) tree, zero-count internal edges collapsed again, the same estimator refitted; 2.5 / 97.5%
-    quantiles of rate and root date, widened to include the point estimate."""
+    """LSD2-style resampling interval (report 98's Poisson x lognormal, with report 101's handling of resolution):
+    counts ~ Poisson(L x fitted duration) x lognormal(mean 1, sd q) on the fitted tree (the resolved tree when
+    ``resolve`` is set), zero-count internal edges collapsed again (as on a fitted tree; report 98 kept the tree
+    fixed), the same estimator refitted (resolution included); 2.5 / 97.5% quantiles of rate and root date, widened to
+    include the point estimate. Skipped (no ``resample`` field) when the point rate is not positive."""
     par, tip, date, y = _arrays(R)
     rate = out['rate']
     dated = tip & np.isfinite(date)
-    x = _node_positions(par, tip, np.where(dated, rate * date, np.nan), y, np.minimum(1.0 / var, 1e18))
+    w = np.where(var > 0, 1.0 / np.where(var > 0, var, 1.0), 1e18)
+    x = _node_positions(par, tip, np.where(dated, rate * date, np.nan), y, np.minimum(w, 1e18))
     B = np.maximum(np.r_[0.0, x[1:] - x[par[1:]]], 0.0)
     rng = np.random.default_rng(seed)
     s2 = np.log(q * q + 1.0)
@@ -549,6 +572,8 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
     t0 = time.time()
     if tip_slack < 0:
         raise ValueError('ls_dated_variance_rate: tip_slack must be >= 0')
+    if 'collapse' in options or 'rate' in options:
+        raise ValueError('lsdv_flat: collapse and rate are not options here (collapse when flattening)')
     o = check_lsdv_options(options) if options else LSDV_OPTIONS
     info = {}
     g = f
@@ -567,6 +592,7 @@ def lsdv_flat(f, L, tip_slack=3.0, rate=None, rounds=1, **options):
     if 'xo_rates' in out and r['slope'] > 0 and np.isfinite(out['rate_se']):
         # cross-fit: keep the member fit's relative SE around the geometric-mean rate
         out['rate_se'] = float(out['rate_se'] * out['rate'] / r['slope'])
+        out['se_rel'] = float(out['rate_se'] / out['rate'])
         h = 1.96 * o['se_inflation'] * out['rate_se'] / out['rate']
         out['rate_ci'] = [out['rate'] * float(np.exp(-h)), out['rate'] * float(np.exp(h))]
     if options:
@@ -595,7 +621,8 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
     Returns a dict: rate, intercept, root_date (nan unless rate > 0), chisq (the
     GLS residual of the fit), plain_rate, plain_intercept, r_val (of the plain
     regression), round_rates, n_nodes (after collapsing), seconds; and the model
-    SE (report 97): rate_se = sqrt(cov[0,0]) of the GLS fit, cov (2x2, slope and
+    SE (report 97): rate_se = sqrt(cov[0,0]) of the GLS fit, se_rel = rate_se /
+    rate (above ~0.5 the interval is uninformative), cov (2x2, slope and
     intercept), root_date_se (delta method), se_inflation and
     rate_ci = rate x exp(+-1.96 se_inflation rate_se / rate).
 
@@ -614,7 +641,8 @@ def ls_dated_variance_rate(tt, tip_slack=3.0, rate=None, rounds=1, collapse=True
     - ``internal_b``: LSD2-style constant added to every internal branch's
       variance, in mutations (b x L in LSD2 units; LSD2's default is 10). 0 = off.
     - ``first_pass``: 'ls' (lsdv's unweighted LS node times) or 'lsd2' (LSD2's run
-      1: joint WLS with V = B + b) for the first round's durations.
+      1: joint WLS with V = B + b) for the first round's durations; with 'lsd2'
+      round 1 uses neither the plain rate nor ``rate``.
     - ``se_inflation``: factor on the SE in ``rate_ci`` (2, reports 97/101).
     - ``resample``: number of LSD2-style resampling replicates (0 = off) for
       ``resample['rate_ci']`` and ``resample['root_date_ci']``; ``resample_q``

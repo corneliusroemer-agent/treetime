@@ -190,3 +190,42 @@ def test_shared_rate_and_final_lsdv_take_the_options(b20):
     assert fl['se_inflation'] == 1.5 and on.summary()['final_lsdv']['rate_se'] == y['rate_se']
     with pytest.raises(ValueError):
         rank_root_candidates(b20, final_lsdv=dict(outlier_z=0), **kw)
+
+
+def test_report93_outputs_gain_no_keys_without_new_options(b20):
+    b = baseline('binary20', shared_rate='lsdv', shared_rate_kwargs={'rounds': 2})
+    assert set(b.shared_rate_info['candidates'][0]) == {'candidate_id', 'regression_rank', 'lsdv_rate', 'plain_rate',
+                                                        'root_date', 'error'}
+    kw = dict(regression_k=2, fit=FIT1, keep_states=False, candidate_sources=plain_candidate_sources(2))
+    fl = rank_root_candidates(b20, final_lsdv=True, **kw).final_lsdv
+    assert set(fl) == {'candidate_id', 'root_id', 'fraction', 'rate', 'root_date', 'plain_rate', 'intercept', 'chisq',
+                       'error'}
+    se = rank_root_candidates(b20, final_lsdv={'se_inflation': 2.0}, **kw).final_lsdv
+    assert se['rate'] == fl['rate'] and se['rate_se'] > 0 and se['se_rel'] == se['rate_se'] / se['rate']
+
+
+def test_outlier_floor_keeps_half_the_dates():
+    tt, f = flat(80, seed=6, internal_min=1)
+    n0 = int(np.sum(np.asarray(f.tip) & np.isfinite(np.asarray(f.date, float))))
+    for z in (0.3, 0.7, 1.0):
+        r = ld.lsdv_flat(f, L, outlier_z=z)
+        assert len(r['outliers']) <= n0 - max(3, n0 // 2) and r['rate'] > 0
+
+
+def test_first_pass_lsd2_does_not_need_the_reference_rate():
+    tt, f = flat(60, seed=8)
+    with pytest.raises(ValueError):
+        ld.lsdv_flat(f, L, rate=-1.0)
+    a = ld.lsdv_flat(f, L, first_pass='lsd2')
+    b = ld.lsdv_flat(f, L, first_pass='lsd2', rate=-1.0)  # round 1 uses neither the plain rate nor ``rate``
+    assert a['rate'] == b['rate']
+    with pytest.raises(ValueError):
+        ld.lsdv_flat(f, L, first_pass='lsd2', rate=-1.0, rounds=2)
+
+
+def test_option_types():
+    tt, f = flat(40, seed=2)
+    for bad in (dict(outlier_z='3'), dict(seed='x'), dict(resample=2.5), dict(outlier_rounds=1.5),
+                dict(resolve_auto_tips=-1), dict(collapse=False)):
+        with pytest.raises(ValueError):
+            ld.lsdv_flat(f, L, **bad)
