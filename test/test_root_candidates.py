@@ -595,7 +595,7 @@ def _rows_without_runtime(res):
 def refit_pair():
     """binary20 ranked at a shared rate 2x the simulated one, with and without the final rate refit."""
     b = make_baseline('binary20', clock_rate=2 * load('binary20')[3]['clock_rate'])
-    kw = dict(regression_k=2, fit=FIT1, candidate_sources=plain_candidate_sources(2))
+    kw = dict(regression_k=2, fit=FIT1, candidate_sources=plain_candidate_sources(2), final_lsdv=False)
     return b, rank_root_candidates(b, **kw), rank_root_candidates(b, final_rate_refit=True, **kw)
 
 
@@ -638,7 +638,7 @@ def test_final_rate_refit_off_by_default_reproduces_old_output(refit_pair):
 
 def test_final_rate_refit_without_states_and_close_window(refit_pair):
     b, off, on = refit_pair
-    kw = dict(regression_k=2, fit=FIT1, candidate_sources=plain_candidate_sources(2))
+    kw = dict(regression_k=2, fit=FIT1, candidate_sources=plain_candidate_sources(2), final_lsdv=False)
     cold = rank_root_candidates(b, keep_states=False, final_rate_refit=True, final_rate_refit_window=50.0, **kw)
     ref = cold.final_rate_refit
     assert cold.best.candidate_id == on.best.candidate_id

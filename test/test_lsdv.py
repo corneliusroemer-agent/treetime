@@ -197,7 +197,10 @@ def test_lsdv_collapse_removes_zero_length_internal_edges():
 # ---------------------------------------------------------------- baseline: lsdv at a placement, shared rate
 
 def baseline(fx, **kw):
+    """Baseline with the pre-116 default shared rate (the regression slope) unless ``shared_rate`` is given."""
     nwk, aln, dates, _ = load(fx)
+    if kw.get('clock_rate') is None:
+        kw.setdefault('shared_rate', 'regression')
     return UnrootedBaseline(nwk, aln, dates, gtr='JC69', **kw)
 
 
@@ -232,15 +235,14 @@ def test_baseline_lsdv_equals_lsdv_on_a_treetime_rooted_there(fx):
     assert n_ok >= 3
 
 
-def test_default_shared_rate_is_the_regression_slope(b60):
+def test_regression_shared_rate_is_the_regression_slope(b60):
     best = b60.regression().find_best_root(force_positive=True)
     assert b60.clock_rate == float(best['slope'])
     assert b60.shared_rate_info is None
 
 
 def test_shared_rate_argument_checks():
-    with pytest.raises(ValueError):
-        baseline('binary20', shared_rate='lsdv', clock_rate=1e-3)
+    assert baseline('binary20', shared_rate='lsdv', clock_rate=1e-3).clock_rate == 1e-3  # a given rate wins
     with pytest.raises(ValueError):
         baseline('binary20', shared_rate='datp')
     with pytest.raises(ValueError):
@@ -326,7 +328,7 @@ def test_lsdv_source_composes_with_the_default_sources(b20):
 
 def test_final_lsdv_reports_without_changing_the_ranking(b20):
     kw = dict(regression_k=2, fit=FIT1, keep_states=False, candidate_sources=plain_candidate_sources(2))
-    off, on = rank_root_candidates(b20, **kw), rank_root_candidates(b20, final_lsdv=True, **kw)
+    off, on = rank_root_candidates(b20, final_lsdv=False, **kw), rank_root_candidates(b20, final_lsdv=True, **kw)
     assert off.final_lsdv is None and 'final_lsdv' not in off.summary() and 'final_lsdv' not in off.config
     assert rows(on) == rows(off)
     x = b20.lsdv(on.best.root_candidate)
@@ -337,8 +339,8 @@ def test_final_lsdv_reports_without_changing_the_ranking(b20):
     assert two.final_lsdv['rate'] == b20.lsdv(two.best.root_candidate, rounds=2)['rate']
 
 
-def test_default_output_has_no_new_fields(b20):
-    res = rank_root_candidates(b20, regression_k=1, fit=FIT1, keep_states=False,
+def test_regression_rate_and_no_final_lsdv_output_has_no_new_fields(b20):
+    res = rank_root_candidates(b20, regression_k=1, fit=FIT1, keep_states=False, final_lsdv=False,
                                candidate_sources=plain_candidate_sources(1))
     assert 'shared_rate_info' not in res.config and 'final_lsdv' not in res.config
     assert not {'final_lsdv', 'shared_rate_source', 'shared_rate_log_range'} & set(res.summary())

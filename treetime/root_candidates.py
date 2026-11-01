@@ -16,8 +16,10 @@ Layout
 * :func:`regression_candidates` -- the best placements of the existing
   root-to-tip regression (:meth:`TreeRegression.rank_roots`).
 * :class:`LsdvSource` -- opt-in candidate source ranked by the lsdv regression
-  (:mod:`treetime.ls_dated_rate`); ``UnrootedBaseline(shared_rate='lsdv')``
-  takes the shared rate from it.
+  (:mod:`treetime.ls_dated_rate`). The shared rate of every candidate fit is the
+  lsdv rate by default (``UnrootedBaseline(shared_rate='lsdv')``), and the
+  reported rate and root date are lsdv's at the winner
+  (``rank_root_candidates(final_lsdv=True)``).
 * :func:`evaluate_root_candidate` -- one candidate from one initialisation: a
   new ``TreeTime`` object, a fixed number of fitting iterations without the
   ``ndiff`` early stop, a fresh likelihood after every time tree, and a copy of
@@ -118,12 +120,12 @@ class UnrootedBaseline:
     gtr : GTR or str
         Fixed substitution model, never re-inferred; deep-copied per candidate.
     clock_rate : float, optional
-        Fixed positive rate shared by all candidates. ``None`` takes it from
-        ``shared_rate``.
-    shared_rate : {'regression', 'lsdv'}
+        Fixed positive rate shared by all candidates (``shared_rate`` is then
+        ignored). ``None`` takes it from ``shared_rate``.
+    shared_rate : {'lsdv', 'regression'}
         Source of the shared rate when ``clock_rate`` is None.
-        ``'regression'`` (default): the slope of the best free-slope plain
-        root-to-tip regression on the baseline. ``'lsdv'``: the lsdv rate
+        ``'regression'``: the slope of the best free-slope plain
+        root-to-tip regression on the baseline. ``'lsdv'`` (default): the lsdv rate
         (:func:`treetime.ls_dated_rate.lsdv_flat`, covariation regression with
         least-squares-dated variances) at the regression's best placement, or
         with ``shared_rate_k`` > 1 the median of the lsdv rates at the top
@@ -161,7 +163,7 @@ class UnrootedBaseline:
     tt_kwargs : dict, optional
         Extra TreeTime constructor arguments (e.g. ``precision``).
 
-    Attributes: ``clock_rate``; ``shared_rate_info`` (None for the default
+    Attributes: ``clock_rate``; ``shared_rate_info`` (None for the
     regression rate or a given ``clock_rate``; for ``'lsdv'`` a dict with the
     rate used, the regression slope, the per-placement lsdv rates and, with
     ``shared_rate_k`` > 1, their spread ``log_range`` = log(max / min), a
@@ -169,7 +171,7 @@ class UnrootedBaseline:
     """
 
     def __init__(self, tree, aln, dates, gtr='JC69', clock_rate=None, optimize_baseline=True,
-                 rng_seed=1234, tt_kwargs=None, shared_rate='regression', shared_rate_k=1, shared_rate_kwargs=None):
+                 rng_seed=1234, tt_kwargs=None, shared_rate='lsdv', shared_rate_k=1, shared_rate_kwargs=None):
         tree = Phylo.read(tree, 'newick') if isinstance(tree, str) else copy.deepcopy(tree)
         self.aln = aln
         self.dates = dict(dates)
@@ -184,8 +186,6 @@ class UnrootedBaseline:
             self._from_phylo(tt.tree, keep_names=True)
         if shared_rate not in ('regression', 'lsdv'):
             raise ValueError("UnrootedBaseline: shared_rate must be 'regression' or 'lsdv'")
-        if shared_rate != 'regression' and clock_rate is not None:
-            raise ValueError('UnrootedBaseline: pass either clock_rate or shared_rate, not both')
         self.shared_rate_info = None
         if clock_rate is None:
             best = self.regression().find_best_root(force_positive=True)
@@ -1225,27 +1225,46 @@ class RootSearchResult:
         return restore_best_fitted_state(self.best)
 
     def headline_treetime(self):
-        """The state behind the headline root date: the winner's final rate refit
-        when one was run and kept its state, else :meth:`best_treetime`."""
+        """The dated tree closest to the headline: the winner's final rate refit
+        when it is the headline and kept its state, else :meth:`best_treetime`
+        (with the 'final_lsdv' headline this state is at the shared rate, not at
+        the lsdv rate)."""
         ref = self.final_rate_refit
         if ref is not None and ref.get('headline') == 'refit' and ref['state'] is not None:
             return ref['state']
         return self.best_treetime()
 
     @property
-    def headline_root_date(self):
-        """Root date of the winner: the final rate refit's when it ran, else the ranking fit's."""
+    def headline_source(self):
+        """Where the headline rate and root date come from: 'final_lsdv' (the lsdv fit at the winner's root, when
+        ``final_lsdv`` ran and gave a positive rate), 'refit' (a final rate refit marked as the headline) or 'fit'
+        (the winner's ranking fit at the shared rate)."""
+        fl = self.final_lsdv
+        if fl is not None and fl.get('error') is None and fl.get('rate') is not None and fl['rate'] > 0:
+            return 'final_lsdv'
         ref = self.final_rate_refit
         if ref is not None and ref.get('headline') == 'refit':
-            return ref['refit_root_date']
+            return 'refit'
+        return 'fit'
+
+    @property
+    def headline_root_date(self):
+        """Root date of the winner (see :attr:`headline_source`)."""
+        src = self.headline_source
+        if src == 'final_lsdv':
+            return self.final_lsdv['root_date']
+        if src == 'refit':
+            return self.final_rate_refit['refit_root_date']
         b = self.best.best_run
         return b.root.get('root_date') if b is not None and b.error is None else None
 
     @property
     def headline_clock_rate(self):
-        ref = self.final_rate_refit
-        if ref is not None and ref.get('headline') == 'refit':
-            return ref['refit_clock_rate']
+        src = self.headline_source
+        if src == 'final_lsdv':
+            return self.final_lsdv['rate']
+        if src == 'refit':
+            return self.final_rate_refit['refit_clock_rate']
         b = self.best.best_run
         return b.clock_rate if b is not None and b.error is None else self.clock_rate
 
@@ -1273,6 +1292,8 @@ class RootSearchResult:
                         'final_rate_refit': final_rate_refit_summary(ref)})
         if self.final_lsdv is not None:
             out['final_lsdv'] = dict(self.final_lsdv)
+            out.update({'headline_root_date': self.headline_root_date, 'headline_clock_rate': self.headline_clock_rate,
+                        'headline_source': self.headline_source})
         sri = self.config.get('shared_rate_info')
         if sri is not None:
             out['shared_rate_source'] = sri['source'] if not sri.get('fallback') else 'regression (lsdv fallback)'
@@ -1603,7 +1624,7 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
                          candidate_sources=None, ranked_sources=None, evaluator=None, final_rate_refit=False,
                          final_rate_evals=FINAL_RATE_EVALS, final_rate_xatol=FINAL_RATE_XATOL,
                          final_rate_iterations=FINAL_RATE_ITERATIONS, final_rate_refit_window=None,
-                         collapse_tol=COLLAPSE_TOL, final_lsdv=False):
+                         collapse_tol=COLLAPSE_TOL, final_lsdv=True):
     """Evaluate explicit and regression-ranked candidates and rank them by fitted
     full marginal log-likelihood.
 
@@ -1726,13 +1747,16 @@ def rank_root_candidates(baseline, explicit=(), regression_k=5, fit=None, sensit
     :class:`~treetime.outgroup_subtree.OutgroupEvaluator`, whose messages depend
     on the candidate. Selection, rate fits and margins are unchanged.
 
-    ``final_lsdv`` (opt-in, report only; ``True`` or a dict of
+    ``final_lsdv`` (default ``True``, or a dict of
     :meth:`UnrootedBaseline.lsdv` options): the lsdv rate and root date at the
     winner's fitted root (``root_candidate``, on the baseline branch lengths),
-    in :attr:`RootSearchResult.final_lsdv` and the summary. ``True`` uses the
-    lsdv defaults (report 107); ``dict(resolve=None, outlier_z=None)`` gives
-    report 93's lsdv. Ranking, scores and the headline are unchanged.
-    ``False`` gives exactly the output without it.
+    in :attr:`RootSearchResult.final_lsdv` and the summary. When it gives a
+    positive rate it is the headline (``headline_clock_rate``,
+    ``headline_root_date``, ``headline_source`` 'final_lsdv'). ``True`` uses the
+    lsdv defaults; ``dict(resolve=None, outlier_z=None)`` gives report 93's
+    lsdv. Ranking and scores do not depend on it. ``False`` gives exactly the
+    output without it, with the ranking fit's rate and root date as the
+    headline.
     """
     fit = fit or FitConfig()
     sources = resolve_candidate_sources(regression_k, candidate_sources, covariation, tip_slack)

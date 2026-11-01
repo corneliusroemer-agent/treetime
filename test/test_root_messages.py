@@ -376,7 +376,7 @@ def test_final_rate_refit_carries_root_state_messages(b20, fitted):
     tt = fitted.state
     o = tt.tree.root._cseq[tt.data.full_to_compressed_sequence_map]
     msg = outgroup_leaf_messages(tt.gtr, o, 0.02)
-    kw = dict(explicit=[true], regression_k=2, fit=FIT, candidate_sources=plain_candidate_sources(2))
+    kw = dict(explicit=[true], regression_k=2, fit=FIT, candidate_sources=plain_candidate_sources(2), final_lsdv=False)
     on = rank_with_root_messages(b, msg, final_rate_refit=True, **kw)
     off = rank_with_root_messages(b, msg, **kw)
     for name in ('stage1', 'stage2b'):

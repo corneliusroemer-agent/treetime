@@ -37,3 +37,35 @@ def test_fewer_false_flags_and_gross_errors_still_caught():
     g = flat(80, seed=6, internal_min=1, planted=5, years=60.0)
     tip = [v for v in range(len(g.par)) if g.tip[v]][5]
     assert g.name[tip] in ld.lsdv_flat(g, L)['outliers']
+
+
+# ---- lsdv is the default shared rate and the headline -------------------------------------------------------------
+def _b(fx='binary20', **kw):
+    from test_root_candidates import load
+    from treetime.root_candidates import UnrootedBaseline
+    nwk, aln, dates, _ = load(fx)
+    return UnrootedBaseline(nwk, aln, dates, gtr='JC69', **kw)
+
+
+def test_default_shared_rate_is_lsdv():
+    from treetime.root_candidates import regression_candidates
+    b, br = _b(), _b(shared_rate='regression')
+    assert b.shared_rate_info['source'] == 'lsdv' and br.shared_rate_info is None
+    top = regression_candidates(br, k=1, covariation=False, slope=None)[0][0]
+    assert b.clock_rate == br.lsdv(top)['rate'] != br.clock_rate
+    assert br.clock_rate == float(br.regression().find_best_root(force_positive=True)['slope'])
+
+
+def test_default_headline_is_final_lsdv():
+    from test_lsdv import FIT1
+    from treetime.root_candidates import plain_candidate_sources, rank_root_candidates
+    b = _b()
+    kw = dict(regression_k=2, fit=FIT1, keep_states=False, candidate_sources=plain_candidate_sources(2))
+    on, off = rank_root_candidates(b, **kw), rank_root_candidates(b, final_lsdv=False, **kw)
+    assert [r.score for r in on.results] == [r.score for r in off.results]
+    fl = on.final_lsdv
+    assert fl['rate'] == b.lsdv(on.best.root_candidate)['rate'] and fl['error'] is None
+    assert on.headline_source == 'final_lsdv' and on.headline_clock_rate == fl['rate']
+    assert on.headline_root_date == fl['root_date'] == on.summary()['headline_root_date']
+    assert off.headline_source == 'fit' and off.final_lsdv is None and 'headline_root_date' not in off.summary()
+    assert off.headline_root_date == off.best.best_run.root['root_date']
