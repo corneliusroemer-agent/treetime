@@ -343,6 +343,17 @@ class UnrootedBaseline:
         treg._tt = tt  # keep the node owner alive
         return treg
 
+    def date_resolved_rate(self, cand, **kwargs):
+        """Clock rate at root ``cand`` by :func:`treetime.resolved_rate.date_resolved_xfit_rate`
+        (covariation regression on a date-resolved copy with cross-fitted weights), on the
+        baseline branch lengths. Costs one joint ancestral reconstruction on the rooted
+        tree, for the mutation positions. ``kwargs`` go to the estimator. Root choice is
+        not affected; this is a rate at a given root."""
+        from .resolved_rate import date_resolved_xfit_rate
+        tt = self.make_treetime(self.rooted_phylo(cand), messages=False)
+        tt.infer_ancestral_sequences('probabilistic', marginal=False, reconstruct_tip_states=False)
+        return date_resolved_xfit_rate(tt, **kwargs)
+
     def topology_signature(self, tree):
         """(set of non-trivial splits, sorted internal degrees) of ``tree`` read as
         unrooted, degree-2 nodes suppressed."""

@@ -428,6 +428,8 @@ def run_timetree(myTree, params, outdir, tree_suffix='', prune_short=True, metho
 
     myTree.tip_slack = params.tip_slack
     myTree.branch_variance_floor = getattr(params, 'branch_variance_floor', None)
+    myTree.clock_rate_method = getattr(params, 'clock_rate_method', None) or 'regression'
+    myTree.clock_rate_method_kwargs = {'seed': getattr(params, 'clock_rate_seed', 0) or 0}
     if not myTree.one_mutation:
         print('TreeTime setup failed, exiting')
         return 1
@@ -970,6 +972,8 @@ def estimate_clock_model(params):
 
     myTree.tip_slack = params.tip_slack
     myTree.branch_variance_floor = getattr(params, 'branch_variance_floor', None)
+    myTree.clock_rate_method = getattr(params, 'clock_rate_method', None) or 'regression'
+    myTree.clock_rate_method_kwargs = {'seed': getattr(params, 'clock_rate_seed', 0) or 0}
     if params.clock_filter:
         n_bad = [n.name for n in myTree.tree.get_terminals() if n.bad_branch]
         myTree.clock_filter(

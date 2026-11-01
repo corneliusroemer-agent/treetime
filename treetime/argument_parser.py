@@ -195,6 +195,21 @@ def add_reroot_group(parser):
         help='with --covariation: extra variance, in mutations, added to every branch of the covariance model '
         '(default: none). Keeps zero-length internal branches from getting zero variance.',
     )
+    parser.add_argument(
+        '--clock-rate-method',
+        choices=['regression', 'date_resolved_xfit'],
+        default='regression',
+        help="how a free clock rate is estimated at the chosen root (root search is unchanged). 'regression' "
+        "(default): root-to-tip regression. 'date_resolved_xfit': covariation regression on a copy of the tree "
+        'with polytomies resolved by dates and cross-fitted branch weights; less biased on trees with many '
+        'polytomies.',
+    )
+    parser.add_argument(
+        '--clock-rate-seed',
+        type=int,
+        default=0,
+        help='with --clock-rate-method date_resolved_xfit: seed of the random alignment-column splits (default 0).',
+    )
 
 
 def add_gtr_arguments(parser):

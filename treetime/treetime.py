@@ -480,12 +480,20 @@ class TreeTime(ClockTree):
             If True, plot the results
 
         """
-        from .clock_filter_methods import residual_filter, local_filter
-
         if n_iqd is None:
             n_iqd = ttconf.NIQD
         if type(reroot) is list and len(reroot) == 1:
             reroot = str(reroot[0])
+
+        # outliers are judged against the regression, whatever clock_rate_method says
+        suspended, self._clock_rate_method_suspended = self._clock_rate_method_suspended, True
+        try:
+            return self._clock_filter(reroot, method, n_iqd, plot, fixed_clock_rate)
+        finally:
+            self._clock_rate_method_suspended = suspended
+
+    def _clock_filter(self, reroot, method, n_iqd, plot, fixed_clock_rate):
+        from .clock_filter_methods import residual_filter, local_filter
 
         if reroot:
             self.reroot(

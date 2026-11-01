@@ -99,6 +99,9 @@ class ClockTree(TreeAnc):
         # to terminal branches in covariance calculation
         self.branch_variance_floor = None  # if set, extra variance (in mutations) added to every
         # branch in the covariation regression, as in LSD's (b + c/L)/L
+        self.clock_rate_method = 'regression'  # or 'date_resolved_xfit', see get_clock_model
+        self.clock_rate_method_kwargs = {}  # options of treetime.resolved_rate.date_resolved_xfit_rate
+        self._clock_rate_method_suspended = False  # set by clock_filter: the filter keeps the regression model
         self.rel_tol_prune = ttconf.REL_TOL_PRUNE
         self.rel_tol_refine = ttconf.REL_TOL_REFINE
         self.branch_length_mode = branch_length_mode
@@ -304,6 +307,30 @@ class ClockTree(TreeAnc):
         return Treg
 
     def get_clock_model(self, covariation=True, slope=None):
+        """Estimate the clock model (rate and intercept) on the current tree.
+
+        With ``self.clock_rate_method == 'regression'`` (default) this is the
+        root-to-tip regression, with or without covariation. With
+        ``'date_resolved_xfit'`` and a free slope, the rate comes from
+        :func:`treetime.resolved_rate.date_resolved_xfit_rate` (a covariation
+        regression on a date-resolved copy of the tree with cross-fitted
+        weights, options in ``self.clock_rate_method_kwargs``) whatever
+        ``covariation`` says; a fixed ``slope`` and the clock filter keep the
+        regression. Root search never calls this method, so it is unchanged.
+        """
+        if (self.clock_rate_method != 'regression' and slope is None
+                and not self._clock_rate_method_suspended):
+            if self.clock_rate_method != 'date_resolved_xfit':
+                raise ValueError("clock_rate_method must be 'regression' or 'date_resolved_xfit'")
+            from .resolved_rate import date_resolved_xfit_rate
+            self.logger('ClockTree.get_clock_model: estimating clock model by date_resolved_xfit', 3)
+            est = date_resolved_xfit_rate(self, **self.clock_rate_method_kwargs)
+            if not (np.isfinite(est['rate']) and est['rate'] > 0):
+                raise ValueError('Clock rate estimation (date_resolved_xfit) failed: rate %s. If your data lacks '
+                                 'temporal signal, please specify the rate explicitly!' % est['rate'])
+            self.clock_model = est.clock_model()
+            self.date2dist = DateConversion.from_regression(self.clock_model)
+            return
         self.logger(f'ClockTree.get_clock_model: estimating clock model with covariation={covariation}', 3)
         Treg = self.setup_TreeRegression(covariation=covariation)
         self.clock_model = Treg.regression(slope=slope)
