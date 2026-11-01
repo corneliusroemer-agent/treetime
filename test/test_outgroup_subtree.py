@@ -312,6 +312,7 @@ def test_extra_candidates_do_not_change_selection():
     fit = FitConfig(iterations=1)
     kw = dict(regression_k=2, attach_k=1, fit=fit, outer_iterations=1)
     r0 = rank_with_outgroup_subtree(b, OutgroupSubtree(b.gtr, ogs), **kw)
+    assert r0.config['attach_mixture_w'] == 0.01  # the default reaches the driver config
     listed = {candidate_key(r.candidate) for r in r0.stage3.results}
     off = next(c for c in b.all_candidates() if candidate_key(b.canonical(c)) not in listed)
     on = r0.stage3.results[-1].candidate

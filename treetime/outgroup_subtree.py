@@ -705,7 +705,7 @@ def rank_with_outgroup_subtree(baseline, outgroup, explicit=(), regression_k=5, 
 
     ``attach_mixture_w``: attachment-mixture weight inside the Stage 3 dated
     fit (:class:`OutgroupEvaluator`). ``None`` (default) is
-    ``DEFAULT_ATTACH_MIXTURE_W`` = 0.01 (report 106), or 0 when
+    ``DEFAULT_ATTACH_MIXTURE_W`` = 0.01, or 0 when
     ``fit_lengths=False`` (the mixture needs fitted lengths); 0 is the unmixed
     Stage 3. With
     w > 0 the Stage 3 scores and ``combined_3`` are mixture log-likelihoods,
